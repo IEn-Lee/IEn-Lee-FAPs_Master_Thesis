@@ -1,0 +1,14 @@
+{
+  "cpu": {
+    "fqbn": "arduino:mbed_giga:giga:split=100_0,target_core=cm7,security=none",
+    "name": "Arduino Giga R1",
+    "type": "serial"
+  },
+  "secrets": [],
+  "included_libs": [
+    {
+      "name": "lvgl",
+      "version": "8.3.10"
+    }
+  ]
+}
