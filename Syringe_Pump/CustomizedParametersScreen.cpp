@@ -33,6 +33,13 @@ static ParamRow rows[DEV_P_COUNT];
 // ===== store =====
 static ParamValue param_store[DEV_P_COUNT] = {
     {"viscosity",   "mPa·s", "60000",   ""},
+
+    {"stroke_per_ml_mm",      "mm",    "13.0",    ""},
+    {"lead_pitch",  "m/rev", "0.0015",  ""},
+    {"max_linear_speed_mm_s", "mm/s",  "8.0",    ""},
+    {"I_limit",     "A",     "2.3",     ""},
+    {"I_plunger",             "m^4",   "8.0927e-11", ""},
+
     {"R",           "m",     "0.0049",  ""},
     {"L",           "m",     "0.062",   ""},
     {"shaft",       "m",     "0.0093",  ""},
@@ -42,10 +49,6 @@ static ParamValue param_store[DEV_P_COUNT] = {
     {"r",           "m",     "0.00013", ""},
     {"l",           "m",     "0.012",   ""},
     // {"volume",      "uL",    "1000",    ""},
-    {"lead_pitch",  "m/rev", "0.0015",  ""},
-    {"I_limit",     "A",     "2.3",     ""},
-    {"stroke_per_ml_mm",      "mm",    "13.0",    ""},
-    {"max_linear_speed_mm_s", "mm/s",  "8.0",    ""}
 };
 
 // ===== keypad map =====
@@ -241,47 +244,63 @@ void build()
 
     createKeyboard(screen_obj);
 
-    createTableRow(scroll_obj, "viscosity",  "Fluid dynamic viscosity",     "e.g. 60000",  &rows[DEV_P_VISCOSITY].ta);
-    rows[DEV_P_VISCOSITY].key = "viscosity"; rows[DEV_P_VISCOSITY].unit = "mPa·s";
-
-    createTableRow(scroll_obj, "R",          "Plunger tip radius",          "e.g. 0.0049", &rows[DEV_P_R].ta);
-    rows[DEV_P_R].key = "R"; rows[DEV_P_R].unit = "m";
-
-    createTableRow(scroll_obj, "L",          "Plunger length",              "e.g. 0.062",  &rows[DEV_P_L].ta);
-    rows[DEV_P_L].key = "L"; rows[DEV_P_L].unit = "m";
-
-    createTableRow(scroll_obj, "shaft",      "Plunger shaft outer width",   "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
-    rows[DEV_P_SHAFT].key = "shaft"; rows[DEV_P_SHAFT].unit = "m";
-
-    createTableRow(scroll_obj, "shaft wall", "Shaft wall thickness",        "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
-    rows[DEV_P_SHAFT_WALL].key = "shaft_walls"; rows[DEV_P_SHAFT_WALL].unit = "m";
-
-    createTableRow(scroll_obj, "E",          "Elastic modulus",             "e.g. 1e9",    &rows[DEV_P_E].ta);
-    rows[DEV_P_E].key = "E"; rows[DEV_P_E].unit = "Pa";
-
-    createTableRow(scroll_obj, "S",          "Safety factor",               "e.g. 3.0",    &rows[DEV_P_S].ta);
-    rows[DEV_P_S].key = "S"; rows[DEV_P_S].unit = "-";
-
-    createTableRow(scroll_obj, "r (cannula)","Cannula inner radius",        "e.g. 0.00013",&rows[DEV_P_r].ta);
-    rows[DEV_P_r].key = "r"; rows[DEV_P_r].unit = "m";
-
-    createTableRow(scroll_obj, "l (cannula)","Cannula length",              "e.g. 0.012",  &rows[DEV_P_l].ta);
-    rows[DEV_P_l].key = "l"; rows[DEV_P_l].unit = "m";
-
-    // createTableRow(scroll_obj, "volume",     "Target volume per shot",      "e.g. 1000",   &rows[DEV_P_VOLUME].ta);
-    // rows[DEV_P_VOLUME].key = "volume"; rows[DEV_P_VOLUME].unit = "uL";
-
-    createTableRow(scroll_obj, "lead pitch", "Lead screw lead",             "e.g. 0.0015", &rows[DEV_P_LEAD_PITCH].ta);
-    rows[DEV_P_LEAD_PITCH].key = "lead_pitch"; rows[DEV_P_LEAD_PITCH].unit = "m/rev";
-
-    createTableRow(scroll_obj, "I_limit",    "Stepper phase current limit", "e.g. 2.3",    &rows[DEV_P_I_LIMIT].ta);
-    rows[DEV_P_I_LIMIT].key = "I_limit"; rows[DEV_P_I_LIMIT].unit = "A";
+    // ===== build() rows =====
+    createTableRow(scroll_obj, "viscosity", "Fluid dynamic viscosity", "e.g. 60000", &rows[DEV_P_VISCOSITY].ta);
+    rows[DEV_P_VISCOSITY].key = "viscosity";
+    rows[DEV_P_VISCOSITY].unit = "mPa·s";
 
     createTableRow(scroll_obj, "stroke / 1 mL", "Linear stroke needed for 1 mL", "e.g. 13.0", &rows[DEV_P_STROKE_PER_ML_MM].ta);
-    rows[DEV_P_STROKE_PER_ML_MM].key = "stroke_per_ml_mm"; rows[DEV_P_STROKE_PER_ML_MM].unit = "mm";
+    rows[DEV_P_STROKE_PER_ML_MM].key = "stroke_per_ml_mm";
+    rows[DEV_P_STROKE_PER_ML_MM].unit = "mm";
 
-    createTableRow(scroll_obj, "max linear speed", "Maximum linear motion speed", "e.g. 8.0", &rows[DEV_P_MAX_LINEAR_SPEED_MM_S].ta);
-    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].key = "max_linear_speed_mm_s"; rows[DEV_P_MAX_LINEAR_SPEED_MM_S].unit = "mm/s";
+    createTableRow(scroll_obj, "lead pitch (m)", "Lead screw lead", "e.g. 0.0015", &rows[DEV_P_LEAD_PITCH].ta);
+    rows[DEV_P_LEAD_PITCH].key = "lead_pitch";
+    rows[DEV_P_LEAD_PITCH].unit = "m/rev";
+
+    createTableRow(scroll_obj, "max linear speed (mm/s)", "Maximum linear motion speed", "e.g. 8.0", &rows[DEV_P_MAX_LINEAR_SPEED_MM_S].ta);
+    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].key = "max_linear_speed_mm_s";
+    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].unit = "mm/s";
+
+    createTableRow(scroll_obj, "I_limit (A)", "Stepper phase current limit", "e.g. 2.3", &rows[DEV_P_I_LIMIT].ta);
+    rows[DEV_P_I_LIMIT].key = "I_limit";
+    rows[DEV_P_I_LIMIT].unit = "A";
+
+    createTableRow(scroll_obj, "I_plunger", "Second moment of area", "e.g. 8.0927e-11", &rows[DEV_P_I_PLUNGER].ta);
+    rows[DEV_P_I_PLUNGER].key = "I_plunger";
+    rows[DEV_P_I_PLUNGER].unit = "m^4";
+
+    // remaining original order
+    createTableRow(scroll_obj, "R", "Plunger tip radius", "e.g. 0.0049", &rows[DEV_P_R].ta);
+    rows[DEV_P_R].key = "R";
+    rows[DEV_P_R].unit = "m";
+
+    createTableRow(scroll_obj, "L", "Plunger length", "e.g. 0.062", &rows[DEV_P_L].ta);
+    rows[DEV_P_L].key = "L";
+    rows[DEV_P_L].unit = "m";
+
+    createTableRow(scroll_obj, "shaft", "Plunger shaft outer width", "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
+    rows[DEV_P_SHAFT].key = "shaft";
+    rows[DEV_P_SHAFT].unit = "m";
+
+    createTableRow(scroll_obj, "shaft wall", "Shaft wall thickness", "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
+    rows[DEV_P_SHAFT_WALL].key = "shaft_walls";
+    rows[DEV_P_SHAFT_WALL].unit = "m";
+
+    createTableRow(scroll_obj, "E", "Elastic modulus", "e.g. 1e9", &rows[DEV_P_E].ta);
+    rows[DEV_P_E].key = "E";
+    rows[DEV_P_E].unit = "Pa";
+
+    createTableRow(scroll_obj, "S", "Safety factor", "e.g. 3.0", &rows[DEV_P_S].ta);
+    rows[DEV_P_S].key = "S";
+    rows[DEV_P_S].unit = "-";
+
+    createTableRow(scroll_obj, "r (cannula)", "Cannula inner radius", "e.g. 0.00013", &rows[DEV_P_r].ta);
+    rows[DEV_P_r].key = "r";
+    rows[DEV_P_r].unit = "m";
+
+    createTableRow(scroll_obj, "l (cannula)", "Cannula length", "e.g. 0.012", &rows[DEV_P_l].ta);
+    rows[DEV_P_l].key = "l";
+    rows[DEV_P_l].unit = "m";
 
     for (int i = 0; i < DEV_P_COUNT; i++) {
         if (rows[i].ta) {

@@ -1469,6 +1469,7 @@ static bool build_realtime_motion_planner_from_current_settings()
     flow_params.I_limit = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_I_LIMIT);
     flow_params.stroke_per_ml_mm = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_STROKE_PER_ML_MM);
     flow_params.max_linear_speed_mm_s = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_MAX_LINEAR_SPEED_MM_S);
+    flow_params.I_plunger = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_I_PLUNGER);
 
     // fixed values for now
     flow_params.eta = 0.30f;

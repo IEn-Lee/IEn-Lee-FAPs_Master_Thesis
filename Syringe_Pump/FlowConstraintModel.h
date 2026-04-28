@@ -60,7 +60,7 @@ public:
           steps_per_rev(3200.0f),
           max_step_freq(50000.0f),
           beta(0.30f),
-          K_buckling(0.5f),
+          K_buckling(1.0f),
           I_plunger(8.0927e-11f)
         {}
     };

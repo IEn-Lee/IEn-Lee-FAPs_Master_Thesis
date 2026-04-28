@@ -9,6 +9,11 @@ namespace CustomizedParametersScreen {
 // ===== Parameter indices =====
 enum ParamIndex {
     DEV_P_VISCOSITY = 0,
+    DEV_P_STROKE_PER_ML_MM,
+    DEV_P_LEAD_PITCH,
+    DEV_P_MAX_LINEAR_SPEED_MM_S,
+    DEV_P_I_LIMIT,
+    DEV_P_I_PLUNGER,
     DEV_P_R,
     DEV_P_L,
     DEV_P_SHAFT,
@@ -18,10 +23,6 @@ enum ParamIndex {
     DEV_P_r,
     DEV_P_l,
     //DEV_P_VOLUME,
-    DEV_P_LEAD_PITCH,
-    DEV_P_I_LIMIT,
-    DEV_P_STROKE_PER_ML_MM,
-    DEV_P_MAX_LINEAR_SPEED_MM_S,
     DEV_P_COUNT
 };
 
