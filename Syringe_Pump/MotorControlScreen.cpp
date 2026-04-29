@@ -1,4 +1,5 @@
 #include "MotorControlScreen.h"
+#include "CustomizedParametersScreen.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -820,4 +821,72 @@ bool isRunning()
     return motor_is_running;
 }
 
+// =========================
+// Start Single Move
+// =========================
+bool startSingleMove(float quantity_uL, float stroke_per_ml_mm)
+{
+    if (quantity_uL <= 0.0f || stroke_per_ml_mm <= 0.0f) {
+        return false;
+    }
+
+    pull_settings_from_ui_internal();
+
+    if (!init_motor_spi_system_internal()) {
+        return false;
+    }
+
+    // uL -> mL -> mm
+    const float quantity_mL = quantity_uL / 1000.0f;
+    const float target_mm = quantity_mL * stroke_per_ml_mm;
+
+    if (target_mm <= 0.0f) {
+        return false;
+    }
+
+    int32_t target_chip =
+        compute_target_chip_from_mode_internal(
+            target_mm,
+            MODE_DISTANCE_MM
+        );
+
+    // Direction dropdown:
+    // 0 = Forward
+    // 1 = Reverse
+    if (g_settings.reverseDirection) {
+        target_chip = -target_chip;
+    }
+
+    current_target_chip = target_chip;
+    stepper.controller.writeTargetPosition(current_target_chip);
+
+    motor_is_running = true;
+    set_status("Low viscosity move");
+
+    return true;
+}
+
+bool motionFinished()
+{
+    if (!motor_spi_ready) return true;
+
+    if (!motor_is_running) return true;
+
+    if (stepper.controller.positionReached()) {
+        motor_is_running = false;
+        set_status("Done");
+        return true;
+    }
+
+    return false;
+}
+
+float getMeasuredCurrentA()
+{
+    if (!motor_spi_ready) return 0.0f;
+    return ina228.getCurrent_mA() / 1000.0f;
+}
+
 } // namespace MotorControlScreen
+
+

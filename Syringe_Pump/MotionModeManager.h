@@ -26,18 +26,15 @@ enum MotionMode {
 enum MotionScenario {
     SCENARIO_NONE = 0,
 
-    // Precision scenarios
-    SCENARIO_EXTRUSION_STARTUP,
+    // precision
     SCENARIO_EXTRUSION_ACTIVE,
     SCENARIO_EXTRUSION_STOPPING,
 
-    // Service scenarios
+    // service
     SCENARIO_HOMING,
     SCENARIO_MANUAL_JOG,
-    SCENARIO_MANUAL_DISTANCE_MOVE,
-    SCENARIO_PLUNGER_DETECTED_RECOVERY,
-    SCENARIO_SERVICE_TEST_MOVE,
-    SCENARIO_REPOSITION
+    SCENARIO_REPOSITION,
+    SCENARIO_LOW_VISCOSITY_EXTRUSION
 };
 
 // =========================

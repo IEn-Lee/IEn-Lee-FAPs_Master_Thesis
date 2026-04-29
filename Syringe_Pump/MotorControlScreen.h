@@ -81,6 +81,15 @@ int32_t computeTargetChipFromMode(float value, MotionInputMode mode);
 bool isReady();
 bool isRunning();
 
+bool startSingleMove(float quantity_uL, float stroke_per_ml_mm);
+bool motionFinished();
+float getMeasuredCurrentA();
+
+// Outer Simple Control
+bool startSingleMove(float quantity_uL);
+void stopMotion();
+bool motionFinished();
+
 } // namespace MotorControlScreen
 
 #endif

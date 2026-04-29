@@ -14,6 +14,7 @@
 #include "MotorControlScreen.h"
 #include "PlungerSpiPositionStreamer.h"
 #include "CustomizedParametersScreen.h"
+#include "MotionModeManager.h"
 
 using namespace PlungerSpiPositionStreamerNS;
 
@@ -76,7 +77,7 @@ static const keypad_config_t viscosity_keypad_cfg = {
     -50,
     false,   // allow decimal
     true,  // allow "00"
-    6       // max chars
+    5       // max chars
 };
 
 static const keypad_config_t quantity_keypad_cfg = {
@@ -86,7 +87,7 @@ static const keypad_config_t quantity_keypad_cfg = {
     -50,
     false,  // no decimal
     true,   // allow "00"
-    6       // max chars
+    4       // max chars
 };
 
 // --- Tab ---
@@ -143,6 +144,13 @@ static unsigned long last_curve_update_ms = 0;
 // --- Global Variables ---
 input_block_t* viscosity_block;
 input_block_t* quantity_block;
+// --- Viscosity Threshold ---
+static constexpr float LOW_VISCOSITY_THRESHOLD_MPA_S = 100.0f;
+static bool low_viscosity_mode_active = false;
+static bool stop_requested = false;
+static bool low_viscosity_timeout = false;
+static unsigned long stop_request_ms = 0;
+
 
 typedef struct {
     const char* key;
@@ -184,6 +192,34 @@ void lv_initial_tabview(void){
 }
 // --------------------------------------
 
+static float predict_low_viscosity_duration(float quantity_uL)
+{
+    MotorControlScreen::pullSettingsFromUi();
+
+    float stroke_per_ml =
+        CustomizedParametersScreen::getSavedFloat(
+            CustomizedParametersScreen::DEV_P_STROKE_PER_ML_MM
+        );
+
+    float vmax =
+        MotorControlScreen::getSettings().maxVelocity;
+
+    if (stroke_per_ml <= 0.0f) stroke_per_ml = 13.0f;
+    if (vmax <= 0.01f) vmax = 1.0f;
+
+    float quantity_ml = quantity_uL / 1000.0f;
+    float move_mm = quantity_ml * stroke_per_ml;
+
+    float t = move_mm / vmax;
+
+    // rough acceleration allowance
+    t *= 1.15f;
+
+    if (t < 0.5f) t = 0.5f;
+
+    return t;
+}
+
 // --- START / STOP Button ---
 static void start_btn_event_cb(lv_event_t* e)
 {
@@ -202,17 +238,67 @@ static void start_btn_event_cb(lv_event_t* e)
             return;
         }
 
-        if (!calculate_predicted_duration()) {
-            show_missing_param_dialog("Failed to build motion planner");
-            return;
-        }
+        float viscosity_value = atof(recorded_viscosity);
+        low_viscosity_mode_active = (viscosity_value <= LOW_VISCOSITY_THRESHOLD_MPA_S);
 
-        if (!build_realtime_spi_streamer_from_current_settings()) {
-            show_missing_param_dialog("Failed to initialize SPI control");
-            return;
-        }
+        if (low_viscosity_mode_active) {
+            // Low viscosity: use TMC internal ramp, no precision planner, no SPI streamer
+            auto tr = MotionModeManager::requestScenario(
+                MotionModeManager::SCENARIO_LOW_VISCOSITY_EXTRUSION
+            );
 
-        show_start_confirm_dialog(btn);
+            if (!tr.success) {
+                show_missing_param_dialog(tr.message);
+                return;
+            }
+
+            // Temporary simple duration estimate
+            // Later you can replace this with TMC ramp duration calculation
+            float q = atof(recorded_quantity);
+
+            recorded_duration_sec_exact =
+                predict_low_viscosity_duration(q);
+
+            recorded_duration_sec = (int)(recorded_duration_sec_exact + 0.5f);
+
+            if (recorded_duration_sec < 1) {
+                recorded_duration_sec = 1;
+            }
+            recorded_duration_valid = true;
+            realtime_curve_volume_max_uL = q;
+            
+            if (realtime_curve_volume_max_uL < 1.0f) {
+                realtime_curve_volume_max_uL = 1.0f;
+            }
+            realtime_motion_planner_valid = false;
+            realtime_streamer_valid = false;
+
+            show_start_confirm_dialog(btn);
+        }
+        else {
+            auto tr = MotionModeManager::requestScenario(
+                MotionModeManager::SCENARIO_EXTRUSION_ACTIVE
+            );
+
+            if (!tr.success) {
+                show_missing_param_dialog(tr.message);
+                return;
+            }
+
+            if (!calculate_predicted_duration()) {
+                MotionModeManager::forceIdle("Failed to build motion planner");
+                show_missing_param_dialog("Failed to build motion planner");
+                return;
+            }
+
+            if (!build_realtime_spi_streamer_from_current_settings()) {
+                MotionModeManager::forceIdle("Failed to initialize SPI control");
+                show_missing_param_dialog("Failed to initialize SPI control");
+                return;
+            }
+
+            show_start_confirm_dialog(btn);
+        }
     }
     else {
         // STOP → reuse existing stop confirm
@@ -274,21 +360,39 @@ void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
 
     // YES event
     lv_obj_add_event_cb(btn_yes, [](lv_event_t* e){
+
+        if (low_viscosity_mode_active)
+        {
+            MotorControlScreen::stopMotion();
+            stop_requested = true;
+            stop_request_ms = millis();
+
+            lv_obj_del(confirm_dialog);
+            confirm_dialog = NULL;
+
+            return;
+        }
+
+        // High viscosity / SPI streaming stop
         is_running = false;
 
         if (realtime_streamer_valid && realtime_streamer.isRunning()) {
             realtime_streamer.stop(true);
         }
 
+        MotionModeManager::forceIdle("User stopped operation");
+
         set_tab3_control_buttons_enabled(true);
-        
+
         if (realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
             float t_s = (millis() - run_start_ms) / 1000.0f;
+
             if (t_s > recorded_duration_sec_exact) {
                 t_s = recorded_duration_sec_exact;
             }
 
-            PlungerMotionPlanner::Sample sample = realtime_motion_planner.evaluate(t_s);
+            PlungerMotionPlanner::Sample sample =
+                realtime_motion_planner.evaluate(t_s);
 
             RealtimeCurveRenderer::pushSample(
                 t_s,
@@ -300,6 +404,8 @@ void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
         }
 
         realtime_motion_planner_valid = false;
+        realtime_streamer_valid = false;
+        recorded_duration_valid = false;
 
         clear_countdown_dialog();
 
@@ -311,8 +417,10 @@ void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
 
         lv_obj_del(confirm_dialog);
         confirm_dialog = NULL;
-    }, LV_EVENT_CLICKED, btn);
 
+        show_finish_dialog();
+
+    }, LV_EVENT_CLICKED, btn);
     // NO event
     lv_obj_add_event_cb(btn_no, [](lv_event_t*){
         lv_obj_del(confirm_dialog);
@@ -426,11 +534,39 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         last_curve_update_ms = 0;
         set_tab3_control_buttons_enabled(false);
 
-        if (realtime_streamer_valid) {
-            if (!realtime_streamer.start(true)) {
+        if (low_viscosity_mode_active)
+        {
+            float q = atof(recorded_quantity);
+
+            float stroke_per_ml =
+                CustomizedParametersScreen::getSavedFloat(
+                    CustomizedParametersScreen::DEV_P_STROKE_PER_ML_MM
+                );
+
+            if (!MotorControlScreen::startSingleMove(q, stroke_per_ml))
+            {
                 is_running = false;
-                show_missing_param_dialog("Failed to start SPI streaming");
+                MotionModeManager::forceIdle("Low viscosity start failed");
+                low_viscosity_mode_active = false;
+
+                lv_obj_del(confirm_dialog);
+                confirm_dialog = NULL;
+
+                show_missing_param_dialog("Low viscosity start failed");
                 return;
+            }
+
+            realtime_streamer_valid = false;
+            realtime_motion_planner_valid = false;
+        }
+        else {
+            if (realtime_streamer_valid) {
+                if (!realtime_streamer.start(true)) {
+                    is_running = false;
+                    MotionModeManager::forceIdle("Failed to start SPI streaming");
+                    show_missing_param_dialog("Failed to start SPI streaming");
+                    return;
+                }
             }
         }
 
@@ -474,6 +610,11 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
 
     // NO → cancel
     lv_obj_add_event_cb(btn_no, [](lv_event_t*){
+        MotionModeManager::forceIdle("User cancelled start");
+        low_viscosity_mode_active = false;
+        realtime_streamer_valid = false;
+        realtime_motion_planner_valid = false;
+        recorded_duration_valid = false;
         lv_obj_del(confirm_dialog);
         confirm_dialog = NULL;
     }, LV_EVENT_CLICKED, NULL);
@@ -1479,7 +1620,6 @@ static bool build_realtime_motion_planner_from_current_settings()
     flow_params.max_step_freq = 50000.0f;
     flow_params.beta = 0.30f;
     flow_params.K_buckling = 0.5f;
-    flow_params.I_plunger = 0.0f;
 
     FlowConstraintModel::Result flow_result = FlowConstraintModel::compute(flow_params);
     if (!flow_result.valid || flow_result.Q_allow <= 0.0f) {
@@ -1589,6 +1729,7 @@ static bool build_realtime_spi_streamer_from_current_settings()
 void setup() {
   Display.begin();
   TouchDetector.begin();
+  MotionModeManager::begin();
 
   lv_initial_tabview();
   CustomizedParametersScreen::initStore();
@@ -1677,10 +1818,66 @@ void setup() {
   set_tab3_control_buttons_enabled(true);
 }
 
-void loop(){
+void loop()
+{
     lv_timer_handler();
 
-    // --- auto stop after duration ---
+    // =============================
+    // PRIORITY: user stop request
+    // =============================
+    if (stop_requested)
+    {
+        bool stopped =
+            MotorControlScreen::motionFinished();
+
+        bool stop_timeout =
+            (millis() - stop_request_ms > 3000);
+
+        if (stopped || stop_timeout)
+        {
+            stop_requested = false;
+            is_running = false;
+
+            MotionModeManager::forceIdle(
+                stop_timeout ? "Stop timeout" : "User stopped"
+            );
+
+            low_viscosity_mode_active = false;
+            low_viscosity_timeout = false;
+            recorded_duration_valid = false;
+
+            set_tab3_control_buttons_enabled(true);
+
+            if (RealtimeCurveRenderer::isInitialized()) {
+                RealtimeCurveRenderer::releaseTempData();
+            }
+
+            realtime_motion_planner_valid = false;
+            realtime_streamer_valid = false;
+
+            if (start_btn)
+            {
+                lv_obj_t* label = lv_obj_get_child(start_btn, 0);
+                lv_label_set_text(label, "START");
+                lv_obj_set_style_bg_color(
+                    start_btn,
+                    lv_color_hex(0x0000FF),
+                    0
+                );
+            }
+
+            clear_countdown_dialog();
+            show_finish_dialog();
+        }
+
+        MotorControlScreen::update();
+        delay(5);
+        return;
+    }
+
+    // =============================
+    // Normal runtime logic
+    // =============================
     if (is_running) {
         bool finished_by_streamer = false;
 
@@ -1689,7 +1886,22 @@ void loop(){
         }
 
         unsigned long elapsed_sec = (millis() - run_start_ms) / 1000;
-        bool finished_by_time = (!realtime_streamer_valid && elapsed_sec >= recorded_duration_sec);
+        bool finished_by_time = false;
+
+        if (low_viscosity_mode_active)
+        {
+            finished_by_time = MotorControlScreen::motionFinished();
+
+            if (!finished_by_time && elapsed_sec > recorded_duration_sec + 5)
+            {
+                low_viscosity_timeout = true;
+                MotorControlScreen::stopMotion();
+                finished_by_time = true;
+            }
+        }
+        else {
+            finished_by_time = (!realtime_streamer_valid && elapsed_sec >= recorded_duration_sec);
+        }
 
         if (finished_by_streamer || finished_by_time) {
             if (realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
@@ -1710,6 +1922,9 @@ void loop(){
 
             is_running = false;
             set_tab3_control_buttons_enabled(true);
+            MotionModeManager::finishCurrentScenario();
+            low_viscosity_mode_active = false;
+            recorded_duration_valid = false;
 
             if (realtime_streamer_valid && realtime_streamer.isRunning()) {
                 realtime_streamer.stop(true);
@@ -1776,9 +1991,14 @@ void loop(){
         unsigned long elapsed_ms = (millis() - run_start_ms);
         unsigned long total_ms = (unsigned long)(recorded_duration_sec_exact * 1000.0f);
 
-        if (elapsed_ms > total_ms)
-         elapsed_ms = total_ms;
-        
+        if (total_ms < 1) {
+            total_ms = 1;
+        }
+
+        if (elapsed_ms > total_ms) {
+            elapsed_ms = total_ms;
+        }
+
         int percent = (int)((elapsed_ms * 100) / total_ms);
 
         lv_arc_set_value(arc_progress, percent);
@@ -1799,21 +2019,28 @@ void loop(){
             last_curve_update_ms = millis();
 
             float t_s = (millis() - run_start_ms) / 1000.0f;
+
+            if (recorded_duration_sec_exact <= 0.0f) {
+                recorded_duration_sec_exact = 1.0f;
+            }
+
             if (t_s > recorded_duration_sec_exact) {
                 t_s = recorded_duration_sec_exact;
             }
 
-            PlungerMotionPlanner::Sample sample = realtime_motion_planner.evaluate(t_s);
+            float q_uL = recorded_quantity ? atof(recorded_quantity) : 0.0f;
+            float ratio = t_s / recorded_duration_sec_exact;
 
-            float current_A = 0.0f;
-            if (realtime_streamer_valid) {
-                current_A = realtime_streamer.getStatus().measured_current_mA / 1000.0f;
-            }
+            if (ratio < 0.0f) ratio = 0.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+
+            float volume_uL = q_uL * ratio;
+            float current_A = MotorControlScreen::getMeasuredCurrentA();
 
             RealtimeCurveRenderer::pushSample(
                 t_s,
-                sample.volume,   // 保留理論 7-segment volume
-                current_A        // 改為真實 INA228 電流
+                volume_uL,
+                current_A
             );
         }
     }

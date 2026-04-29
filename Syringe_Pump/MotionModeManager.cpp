@@ -39,9 +39,10 @@ void apply_state(MotionScenario scenario) {
     g_state.busy = (scenario != SCENARIO_NONE);
 }
 
-bool is_precision_scenario_internal(MotionScenario scenario) {
-    switch (scenario) {
-        case SCENARIO_EXTRUSION_STARTUP:
+bool is_precision_scenario_internal(MotionScenario scenario)
+{
+    switch (scenario)
+    {
         case SCENARIO_EXTRUSION_ACTIVE:
         case SCENARIO_EXTRUSION_STOPPING:
             return true;
@@ -51,14 +52,14 @@ bool is_precision_scenario_internal(MotionScenario scenario) {
     }
 }
 
-bool is_service_scenario_internal(MotionScenario scenario) {
+bool is_service_scenario_internal(MotionScenario scenario)
+{
     switch (scenario) {
+
         case SCENARIO_HOMING:
         case SCENARIO_MANUAL_JOG:
-        case SCENARIO_MANUAL_DISTANCE_MOVE:
-        case SCENARIO_PLUNGER_DETECTED_RECOVERY:
-        case SCENARIO_SERVICE_TEST_MOVE:
         case SCENARIO_REPOSITION:
+        case SCENARIO_LOW_VISCOSITY_EXTRUSION:
             return true;
 
         default:
@@ -252,32 +253,22 @@ TransitionResult requestScenario(MotionScenario scenario) {
     );
 }
 
-TransitionResult requestMode(MotionMode mode) {
-    switch (mode) {
+TransitionResult requestMode(MotionMode mode)
+{
+    switch (mode)
+    {
         case MODE_IDLE:
             reset();
-            return make_result(
-                true,
-                g_state.mode,
-                g_state.scenario,
-                g_state.backend,
-                "Mode set to idle"
-            );
+            return make_result(true, g_state.mode, g_state.scenario, g_state.backend, "Mode set to idle");
 
         case MODE_PRECISION_EXTRUSION:
             return requestScenario(SCENARIO_EXTRUSION_ACTIVE);
 
         case MODE_SERVICE_MOTION:
-            return requestScenario(SCENARIO_SERVICE_TEST_MOVE);
+            return requestScenario(SCENARIO_HOMING);
 
         default:
-            return make_result(
-                false,
-                g_state.mode,
-                g_state.scenario,
-                g_state.backend,
-                "Unknown mode"
-            );
+            return make_result(false, g_state.mode, g_state.scenario, g_state.backend, "Unknown mode");
     }
 }
 
@@ -319,28 +310,31 @@ const char* modeToString(MotionMode mode) {
     }
 }
 
-const char* scenarioToString(MotionScenario scenario) {
-    switch (scenario) {
+const char* scenarioToString(MotionScenario scenario)
+{
+    switch (scenario)
+    {
         case SCENARIO_NONE:
             return "NONE";
-        case SCENARIO_EXTRUSION_STARTUP:
-            return "EXTRUSION_STARTUP";
-        case SCENARIO_EXTRUSION_ACTIVE:
-            return "EXTRUSION_ACTIVE";
-        case SCENARIO_EXTRUSION_STOPPING:
-            return "EXTRUSION_STOPPING";
+
         case SCENARIO_HOMING:
             return "HOMING";
+
         case SCENARIO_MANUAL_JOG:
             return "MANUAL_JOG";
-        case SCENARIO_MANUAL_DISTANCE_MOVE:
-            return "MANUAL_DISTANCE_MOVE";
-        case SCENARIO_PLUNGER_DETECTED_RECOVERY:
-            return "PLUNGER_DETECTED_RECOVERY";
-        case SCENARIO_SERVICE_TEST_MOVE:
-            return "SERVICE_TEST_MOVE";
+
         case SCENARIO_REPOSITION:
             return "REPOSITION";
+
+        case SCENARIO_LOW_VISCOSITY_EXTRUSION:
+            return "LOW_VISCOSITY_EXTRUSION";
+
+        case SCENARIO_EXTRUSION_ACTIVE:
+            return "EXTRUSION_ACTIVE";
+
+        case SCENARIO_EXTRUSION_STOPPING:
+            return "EXTRUSION_STOPPING";
+
         default:
             return "UNKNOWN_SCENARIO";
     }
