@@ -1,0 +1,3 @@
+此版本為最全面的設計，其中包含不同的黏滯性下的模式控制:
+1. TMC internal ramp generator, 用於低黏滯性液體的快速簡易控制
+2. 7-segment S-Curve 物理限制下的連續性曲線(最完整的控制曲線)，並使用streamer把曲線轉換成SPI控制指令(但準確度會受限於與TMC對話頻率)
