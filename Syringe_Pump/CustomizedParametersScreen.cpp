@@ -16,6 +16,7 @@ static lv_obj_t* scroll_obj = NULL;
 static lv_obj_t* kb_obj = NULL;
 static lv_obj_t* kb_target_ta = NULL;
 static lv_obj_t* default_confirm_dialog = NULL;
+static lv_obj_t* save_done_dialog = NULL;
 
 // ===== style =====
 static lv_style_t st_cell;
@@ -32,23 +33,27 @@ static ParamRow rows[DEV_P_COUNT];
 
 // ===== store =====
 static ParamValue param_store[DEV_P_COUNT] = {
-    {"viscosity",   "mPa·s", "60000",   ""},
+    {"viscosity", "mPa.s", "60000", ""},
 
-    {"stroke_per_ml_mm",      "mm",    "13.0",    ""},
-    {"lead_pitch",  "m/rev", "0.0015",  ""},
-    {"max_linear_speed_mm_s", "mm/s",  "8.0",    ""},
-    {"I_limit",     "A",     "2.3",     ""},
-    {"I_plunger",             "m^4",   "8.0927e-11", ""},
+    // Syringe and motion conversion
+    {"stroke_per_ml_mm", "mm/mL", "13.0", ""},
+    {"lead_pitch", "m/rev", "0.0015", ""},
+    {"max_linear_speed_mm_s", "mm/s", "0.3", ""},
 
-    {"R",           "m",     "0.0049",  ""},
-    {"L",           "m",     "0.062",   ""},
-    {"shaft",       "m",     "0.0093",  ""},
-    {"shaft_walls", "m",     "0.0008",  ""},
-    {"E",           "Pa",    "1e9",     ""},
-    {"S",           "-",     "3.0",     ""},
-    {"r",           "m",     "0.00013", ""},
-    {"l",           "m",     "0.012",   ""},
-    // {"volume",      "uL",    "1000",    ""},
+    // User-visible current/load limit
+    {"I_limit", "A", "2.3", ""},
+
+    // Plunger structure
+    {"I_plunger", "m^4", "8.0927e-11", ""},
+    {"R", "m", "0.0049", ""},
+    {"L", "m", "0.062", ""},
+    {"shaft", "m", "0.0093", ""},
+    {"shaft_walls", "m", "0.0008", ""},
+    {"E", "Pa", "1e9", ""},
+
+    // Needle or cannula
+    {"r", "m", "0.00013", ""},
+    {"l", "m", "0.012", ""}
 };
 
 // ===== keypad map =====
@@ -56,8 +61,8 @@ static const char * num_kb_map[] = {
     "1", "2", "3", "\n",
     "4", "5", "6", "\n",
     "7", "8", "9", "\n",
-    "0", "00", ".", "\n",
-    LV_SYMBOL_BACKSPACE, LV_SYMBOL_NEW_LINE, ""
+    "0", ".", "e", "\n",
+    "-", LV_SYMBOL_BACKSPACE, LV_SYMBOL_NEW_LINE, ""
 };
 
 // ===== helpers =====
@@ -89,6 +94,47 @@ static void kbEventCb(lv_event_t* e)
         kb_target_ta = NULL;
     }
     else {
+        const char* cur = lv_textarea_get_text(kb_target_ta);
+        if (!cur) cur = "";
+
+        // Only one decimal point before exponent.
+        if (strcmp(txt, ".") == 0) {
+            const char* e_pos = strchr(cur, 'e');
+            if (e_pos) {
+                return;
+            }
+            if (strchr(cur, '.') != NULL) {
+                return;
+            }
+        }
+
+        // Only one exponent marker.
+        if (strcmp(txt, "e") == 0) {
+            if (strlen(cur) == 0) {
+                return;
+            }
+            if (strchr(cur, 'e') != NULL) {
+                return;
+            }
+        }
+
+        // '-' is allowed only as first char or immediately after 'e'.
+        if (strcmp(txt, "-") == 0) {
+            size_t len = strlen(cur);
+
+            if (len == 0) {
+                lv_textarea_add_text(kb_target_ta, txt);
+                return;
+            }
+
+            if (cur[len - 1] == 'e') {
+                lv_textarea_add_text(kb_target_ta, txt);
+                return;
+            }
+
+            return;
+        }
+
         lv_textarea_add_text(kb_target_ta, txt);
     }
 }
@@ -182,263 +228,23 @@ static lv_obj_t* createTableRow(
     return row;
 }
 
-static void backBtnEventCb(lv_event_t* e)
-{
-    LV_UNUSED(e);
-
-    if (main_screen_obj) {
-        lv_scr_load(main_screen_obj);
-    }
-    lv_async_call(destroyAsync, NULL);
-}
-
-static void saveBtnEventCb(lv_event_t* e)
-{
-    LV_UNUSED(e);
-    saveParameters();
-    showSaveDoneDialog();
-}
-
-} // anonymous namespace
-
-void setMainScreen(lv_obj_t* screen)
-{
-    main_screen_obj = screen;
-}
-
-void initStore()
-{
-    for (int i = 0; i < DEV_P_COUNT; i++) {
-        strncpy(param_store[i].saved_str,
-                param_store[i].default_str,
-                sizeof(param_store[i].saved_str) - 1);
-        param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
-    }
-}
-
-void build()
-{
-    if (screen_obj) return;
-
-    screen_obj = lv_obj_create(NULL);
-    lv_obj_clear_flag(screen_obj, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* title = lv_label_create(screen_obj);
-    lv_label_set_text(title, "Customized Parameters");
-    lv_obj_set_style_text_font(title, &montserrat_40, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-
-    scroll_obj = lv_obj_create(screen_obj);
-    lv_obj_set_size(scroll_obj, 760, 320);
-    lv_obj_align(scroll_obj, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_pad_all(scroll_obj, 10, 0);
-    lv_obj_set_scroll_dir(scroll_obj, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(scroll_obj, LV_SCROLLBAR_MODE_ACTIVE);
-
-    lv_obj_set_flex_flow(scroll_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(scroll_obj,
-                          LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_gap(scroll_obj, 10, 0);
-
-    createKeyboard(screen_obj);
-
-    // ===== build() rows =====
-    createTableRow(scroll_obj, "viscosity", "Fluid dynamic viscosity", "e.g. 60000", &rows[DEV_P_VISCOSITY].ta);
-    rows[DEV_P_VISCOSITY].key = "viscosity";
-    rows[DEV_P_VISCOSITY].unit = "mPa·s";
-
-    createTableRow(scroll_obj, "stroke / 1 mL", "Linear stroke needed for 1 mL", "e.g. 13.0", &rows[DEV_P_STROKE_PER_ML_MM].ta);
-    rows[DEV_P_STROKE_PER_ML_MM].key = "stroke_per_ml_mm";
-    rows[DEV_P_STROKE_PER_ML_MM].unit = "mm";
-
-    createTableRow(scroll_obj, "lead pitch (m)", "Lead screw lead", "e.g. 0.0015", &rows[DEV_P_LEAD_PITCH].ta);
-    rows[DEV_P_LEAD_PITCH].key = "lead_pitch";
-    rows[DEV_P_LEAD_PITCH].unit = "m/rev";
-
-    createTableRow(scroll_obj, "max linear speed (mm/s)", "Maximum linear motion speed", "e.g. 8.0", &rows[DEV_P_MAX_LINEAR_SPEED_MM_S].ta);
-    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].key = "max_linear_speed_mm_s";
-    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].unit = "mm/s";
-
-    createTableRow(scroll_obj, "I_limit (A)", "Stepper phase current limit", "e.g. 2.3", &rows[DEV_P_I_LIMIT].ta);
-    rows[DEV_P_I_LIMIT].key = "I_limit";
-    rows[DEV_P_I_LIMIT].unit = "A";
-
-    createTableRow(scroll_obj, "I_plunger", "Second moment of area", "e.g. 8.0927e-11", &rows[DEV_P_I_PLUNGER].ta);
-    rows[DEV_P_I_PLUNGER].key = "I_plunger";
-    rows[DEV_P_I_PLUNGER].unit = "m^4";
-
-    // remaining original order
-    createTableRow(scroll_obj, "R", "Plunger tip radius", "e.g. 0.0049", &rows[DEV_P_R].ta);
-    rows[DEV_P_R].key = "R";
-    rows[DEV_P_R].unit = "m";
-
-    createTableRow(scroll_obj, "L", "Plunger length", "e.g. 0.062", &rows[DEV_P_L].ta);
-    rows[DEV_P_L].key = "L";
-    rows[DEV_P_L].unit = "m";
-
-    createTableRow(scroll_obj, "shaft", "Plunger shaft outer width", "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
-    rows[DEV_P_SHAFT].key = "shaft";
-    rows[DEV_P_SHAFT].unit = "m";
-
-    createTableRow(scroll_obj, "shaft wall", "Shaft wall thickness", "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
-    rows[DEV_P_SHAFT_WALL].key = "shaft_walls";
-    rows[DEV_P_SHAFT_WALL].unit = "m";
-
-    createTableRow(scroll_obj, "E", "Elastic modulus", "e.g. 1e9", &rows[DEV_P_E].ta);
-    rows[DEV_P_E].key = "E";
-    rows[DEV_P_E].unit = "Pa";
-
-    createTableRow(scroll_obj, "S", "Safety factor", "e.g. 3.0", &rows[DEV_P_S].ta);
-    rows[DEV_P_S].key = "S";
-    rows[DEV_P_S].unit = "-";
-
-    createTableRow(scroll_obj, "r (cannula)", "Cannula inner radius", "e.g. 0.00013", &rows[DEV_P_r].ta);
-    rows[DEV_P_r].key = "r";
-    rows[DEV_P_r].unit = "m";
-
-    createTableRow(scroll_obj, "l (cannula)", "Cannula length", "e.g. 0.012", &rows[DEV_P_l].ta);
-    rows[DEV_P_l].key = "l";
-    rows[DEV_P_l].unit = "m";
-
-    for (int i = 0; i < DEV_P_COUNT; i++) {
-        if (rows[i].ta) {
-            lv_textarea_set_text(rows[i].ta, param_store[i].saved_str);
-        }
-    }
-
-    lv_obj_t* btn_back = lv_btn_create(screen_obj);
-    lv_obj_set_size(btn_back, 160, 60);
-    lv_obj_set_style_bg_color(btn_back, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
-    lv_obj_align(btn_back, LV_ALIGN_BOTTOM_LEFT, 20, -20);
-    lv_obj_add_event_cb(btn_back, backBtnEventCb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_back = lv_label_create(btn_back);
-    lv_label_set_text(lbl_back, "BACK");
-    lv_obj_set_style_text_font(lbl_back, &montserrat_24, 0);
-    lv_obj_center(lbl_back);
-
-    lv_obj_t* btn_save = lv_btn_create(screen_obj);
-    lv_obj_set_size(btn_save, 160, 60);
-    lv_obj_align(btn_save, LV_ALIGN_BOTTOM_MID, 0, -20);
-    lv_obj_add_event_cb(btn_save, saveBtnEventCb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_save = lv_label_create(btn_save);
-    lv_label_set_text(lbl_save, "SAVE");
-    lv_obj_set_style_text_font(lbl_save, &montserrat_24, 0);
-    lv_obj_center(lbl_save);
-
-    lv_obj_t* btn_default = lv_btn_create(screen_obj);
-    lv_obj_set_size(btn_default, 160, 60);
-    lv_obj_align(btn_default, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
-    lv_obj_add_event_cb(btn_default, [](lv_event_t* e){
-        LV_UNUSED(e);
-        showDefaultConfirmDialog();
-    }, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_default = lv_label_create(btn_default);
-    lv_label_set_text(lbl_default, "DEFAULT");
-    lv_obj_set_style_text_font(lbl_default, &montserrat_24, 0);
-    lv_obj_center(lbl_default);
-}
-
-lv_obj_t* getScreen()
-{
-    return screen_obj;
-}
-
-lv_obj_t** getScreenHandle()
-{
-    return &screen_obj;
-}
-
-void destroy()
-{
-    if (screen_obj) {
-        lv_obj_del(screen_obj);
-        screen_obj = NULL;
-    }
-
-    scroll_obj = NULL;
-    kb_obj = NULL;
-    kb_target_ta = NULL;
-    default_confirm_dialog = NULL;
-
-    for (int i = 0; i < DEV_P_COUNT; i++) {
-        rows[i].ta = NULL;
-        rows[i].key = NULL;
-        rows[i].unit = NULL;
-    }
-}
-
-void destroyAsync(void* user_data)
-{
-    LV_UNUSED(user_data);
-    destroy();
-}
-
-void saveParameters()
-{
-    for (int i = 0; i < DEV_P_COUNT; i++) {
-        if (!rows[i].ta) continue;
-
-        const char* txt = lv_textarea_get_text(rows[i].ta);
-        if (txt && strlen(txt) > 0) {
-            strncpy(param_store[i].saved_str,
-                    txt,
-                    sizeof(param_store[i].saved_str) - 1);
-            param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
-        }
-    }
-}
-
-void resetParametersToDefault()
-{
-    for (int i = 0; i < DEV_P_COUNT; i++) {
-        strncpy(param_store[i].saved_str,
-                param_store[i].default_str,
-                sizeof(param_store[i].saved_str) - 1);
-        param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
-
-        if (rows[i].ta) {
-            lv_textarea_set_text(rows[i].ta, param_store[i].saved_str);
-        }
-    }
-}
-
-const char* getSavedValue(int idx)
-{
-    if (idx < 0 || idx >= DEV_P_COUNT) return "";
-    return param_store[idx].saved_str;
-}
-
-float getSavedFloat(int idx)
-{
-    if (idx < 0 || idx >= DEV_P_COUNT) return 0.0f;
-    return atof(param_store[idx].saved_str);
-}
-
-ParamValue* getStore()
-{
-    return param_store;
-}
-
 void showSaveDoneDialog()
 {
-    lv_obj_t* dialog = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(dialog, 440, 220);
-    lv_obj_center(dialog);
-    lv_obj_set_style_radius(dialog, 12, 0);
-    lv_obj_set_style_pad_all(dialog, 20, 0);
-    lv_obj_set_style_bg_color(dialog, lv_palette_lighten(LV_PALETTE_GREY, 3), 0);
+    if (save_done_dialog) return;
 
-    lv_obj_t* label = lv_label_create(dialog);
+    save_done_dialog = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(save_done_dialog, 440, 220);
+    lv_obj_center(save_done_dialog);
+    lv_obj_set_style_radius(save_done_dialog, 12, 0);
+    lv_obj_set_style_pad_all(save_done_dialog, 20, 0);
+    lv_obj_set_style_bg_color(save_done_dialog, lv_palette_lighten(LV_PALETTE_GREY, 3), 0);
+
+    lv_obj_t* label = lv_label_create(save_done_dialog);
     lv_label_set_text(label, "Parameters saved");
     lv_obj_set_style_text_font(label, &montserrat_34, 0);
     lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 20);
 
-    lv_obj_t* btn_ok = lv_btn_create(dialog);
+    lv_obj_t* btn_ok = lv_btn_create(save_done_dialog);
     lv_obj_set_size(btn_ok, 120, 60);
     lv_obj_align(btn_ok, LV_ALIGN_BOTTOM_MID, 0, 0);
 
@@ -447,10 +253,47 @@ void showSaveDoneDialog()
     lv_obj_set_style_text_font(lbl_ok, &montserrat_26, 0);
     lv_obj_center(lbl_ok);
 
-    lv_obj_add_event_cb(btn_ok, [](lv_event_t* e){
-        lv_obj_t* dialog = (lv_obj_t*)lv_event_get_user_data(e);
+    lv_obj_add_event_cb(btn_ok, [](lv_event_t*) {
+        if (save_done_dialog) {
+            lv_obj_del(save_done_dialog);
+            save_done_dialog = NULL;
+        }
+    }, LV_EVENT_CLICKED, NULL);
+}
+
+static lv_timer_t* done_timer = NULL;
+
+static void doneTimerCb(lv_timer_t* t)
+{
+    lv_obj_t* dialog = (lv_obj_t*)t->user_data;
+
+    if (dialog) {
         lv_obj_del(dialog);
-    }, LV_EVENT_CLICKED, dialog);
+    }
+
+    done_timer = NULL;
+    lv_timer_del(t);
+}
+
+static void showDoneDialog(const char* msg)
+{
+    lv_obj_t* dialog = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(dialog, 420, 220);
+    lv_obj_center(dialog);
+
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_set_style_pad_all(dialog, 20, 0);
+    lv_obj_set_style_bg_color(dialog,
+        lv_palette_lighten(LV_PALETTE_GREY, 3), 0);
+
+    lv_obj_t* label = lv_label_create(dialog);
+    lv_label_set_text(label, msg);
+    lv_obj_set_style_text_font(label, &montserrat_34, 0);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+
+    // auto close after 3000 ms
+    done_timer = lv_timer_create(doneTimerCb, 3000, dialog);
+    lv_timer_set_repeat_count(done_timer, 1);
 }
 
 void showDefaultConfirmDialog()
@@ -497,7 +340,7 @@ void showDefaultConfirmDialog()
         lv_obj_del(default_confirm_dialog);
         default_confirm_dialog = NULL;
 
-        showSaveDoneDialog();
+        //showSaveDoneDialog();
     }, LV_EVENT_CLICKED, NULL);
 
     lv_obj_add_event_cb(btn_no, [](lv_event_t* e){
@@ -505,6 +348,288 @@ void showDefaultConfirmDialog()
         lv_obj_del(default_confirm_dialog);
         default_confirm_dialog = NULL;
     }, LV_EVENT_CLICKED, NULL);
+}
+
+static void backBtnEventCb(lv_event_t* e)
+{
+    LV_UNUSED(e);
+
+    if (main_screen_obj) {
+        lv_scr_load(main_screen_obj);
+    }
+    lv_async_call(destroyAsync, NULL);
+}
+
+static void saveBtnEventCb(lv_event_t* e)
+{
+    LV_UNUSED(e);
+
+    // if (kb_obj) {
+    //     lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+    // }
+
+    // if (kb_target_ta) {
+    //     lv_obj_clear_state(kb_target_ta, LV_STATE_FOCUSED);
+    //     kb_target_ta = NULL;
+    // }
+
+    if (kb_obj) lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+    kb_target_ta = NULL;
+
+    saveParameters();
+
+    // lv_async_call([](void*) {
+    //     showSaveDoneDialog();
+    // }, NULL);
+
+    lv_async_call([](void*){
+        showDoneDialog("Parameters Saved");
+    }, NULL);
+
+}
+
+} // anonymous namespace
+
+void setMainScreen(lv_obj_t* screen)
+{
+    main_screen_obj = screen;
+}
+
+void initStore()
+{
+    for (int i = 0; i < DEV_P_COUNT; i++) {
+        strncpy(param_store[i].saved_str,
+                param_store[i].default_str,
+                sizeof(param_store[i].saved_str) - 1);
+        param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
+    }
+}
+
+lv_obj_t* getScreen()
+{
+    return screen_obj;
+}
+
+lv_obj_t** getScreenHandle()
+{
+    return &screen_obj;
+}
+
+void destroy()
+{
+    if (screen_obj) {
+        lv_obj_del(screen_obj);
+        screen_obj = NULL;
+    }
+
+    scroll_obj = NULL;
+    kb_obj = NULL;
+    kb_target_ta = NULL;
+    default_confirm_dialog = NULL;
+    save_done_dialog = NULL;
+
+    for (int i = 0; i < DEV_P_COUNT; i++) {
+        rows[i].ta = NULL;
+        rows[i].key = NULL;
+        rows[i].unit = NULL;
+    }
+}
+
+void destroyAsync(void* user_data)
+{
+    LV_UNUSED(user_data);
+    destroy();
+}
+
+void saveParameters()
+{
+    for (int i = 0; i < DEV_P_COUNT; i++) {
+        if (!rows[i].ta) continue;
+
+        const char* txt = lv_textarea_get_text(rows[i].ta);
+        if (!txt) txt = "";
+
+        strncpy(param_store[i].saved_str,
+                txt,
+                sizeof(param_store[i].saved_str) - 1);
+        param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
+    }
+}
+
+void resetParametersToDefault()
+{
+    for (int i = 0; i < DEV_P_COUNT; i++) {
+        strncpy(param_store[i].saved_str,
+                param_store[i].default_str,
+                sizeof(param_store[i].saved_str) - 1);
+        param_store[i].saved_str[sizeof(param_store[i].saved_str) - 1] = '\0';
+
+        if (rows[i].ta) {
+            lv_textarea_set_text(rows[i].ta, param_store[i].saved_str);
+        }
+    }
+}
+
+const char* getSavedValue(int idx)
+{
+    if (idx < 0 || idx >= DEV_P_COUNT) return "";
+    return param_store[idx].saved_str;
+}
+
+float getSavedFloat(int idx)
+{
+    if (idx < 0 || idx >= DEV_P_COUNT) return 0.0f;
+
+    const char* txt = param_store[idx].saved_str;
+    if (!txt || txt[0] == '\0') {
+        return 0.0f;
+    }
+
+    return atof(txt);
+}
+
+ParamValue* getStore()
+{
+    return param_store;
+}
+
+void build()
+{
+    if (screen_obj) return;
+
+    screen_obj = lv_obj_create(NULL);
+    lv_obj_clear_flag(screen_obj, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(screen_obj);
+    lv_label_set_text(title, "Customized Parameters");
+    lv_obj_set_style_text_font(title, &montserrat_40, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+
+    scroll_obj = lv_obj_create(screen_obj);
+    lv_obj_set_size(scroll_obj, 760, 320);
+    lv_obj_align(scroll_obj, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_pad_all(scroll_obj, 10, 0);
+    lv_obj_set_scroll_dir(scroll_obj, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(scroll_obj, LV_SCROLLBAR_MODE_ACTIVE);
+
+    lv_obj_set_flex_flow(scroll_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scroll_obj,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(scroll_obj, 10, 0);
+
+    createKeyboard(screen_obj);
+
+    // ===== build() rows =====
+    createTableRow(scroll_obj, "viscosity", "Fluid dynamic viscosity", "e.g. 60000", &rows[DEV_P_VISCOSITY].ta);
+    rows[DEV_P_VISCOSITY].key = "viscosity";
+    rows[DEV_P_VISCOSITY].unit = "mPa.s";
+
+    createTableRow(scroll_obj, "stroke / 1 mL", "Linear stroke needed for 1 mL", "e.g. 13.0", &rows[DEV_P_STROKE_PER_ML_MM].ta);
+    rows[DEV_P_STROKE_PER_ML_MM].key = "stroke_per_ml_mm";
+    rows[DEV_P_STROKE_PER_ML_MM].unit = "mm";
+
+    createTableRow(scroll_obj, "lead pitch (m)", "Lead screw lead", "e.g. 0.0015", &rows[DEV_P_LEAD_PITCH].ta);
+    rows[DEV_P_LEAD_PITCH].key = "lead_pitch";
+    rows[DEV_P_LEAD_PITCH].unit = "m/rev";
+
+    createTableRow(scroll_obj, "max linear speed (mm/s)", "Maximum linear motion speed", "e.g. 0.3", &rows[DEV_P_MAX_LINEAR_SPEED_MM_S].ta);
+    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].key = "max_linear_speed_mm_s";
+    rows[DEV_P_MAX_LINEAR_SPEED_MM_S].unit = "mm/s";
+
+    createTableRow(scroll_obj, "I_limit (A)", "Stepper phase current limit", "e.g. 2.3", &rows[DEV_P_I_LIMIT].ta);
+    rows[DEV_P_I_LIMIT].key = "I_limit";
+    rows[DEV_P_I_LIMIT].unit = "A";
+
+    createTableRow(scroll_obj, "I_plunger", "Second moment of area", "e.g. 8.0927e-11", &rows[DEV_P_I_PLUNGER].ta);
+    rows[DEV_P_I_PLUNGER].key = "I_plunger";
+    rows[DEV_P_I_PLUNGER].unit = "m^4";
+
+    // remaining original order
+    createTableRow(scroll_obj, "R", "Plunger tip radius", "e.g. 0.0049", &rows[DEV_P_R].ta);
+    rows[DEV_P_R].key = "R";
+    rows[DEV_P_R].unit = "m";
+
+    createTableRow(scroll_obj, "L", "Plunger length", "e.g. 0.062", &rows[DEV_P_L].ta);
+    rows[DEV_P_L].key = "L";
+    rows[DEV_P_L].unit = "m";
+
+    createTableRow(scroll_obj, "shaft", "Plunger shaft outer width", "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
+    rows[DEV_P_SHAFT].key = "shaft";
+    rows[DEV_P_SHAFT].unit = "m";
+
+    createTableRow(scroll_obj, "shaft wall", "Shaft wall thickness", "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
+    rows[DEV_P_SHAFT_WALL].key = "shaft_walls";
+    rows[DEV_P_SHAFT_WALL].unit = "m";
+
+    createTableRow(scroll_obj, "E", "Elastic modulus", "e.g. 1e9", &rows[DEV_P_E].ta);
+    rows[DEV_P_E].key = "E";
+    rows[DEV_P_E].unit = "Pa";
+
+    createTableRow(scroll_obj, "r (cannula)", "Cannula inner radius", "e.g. 0.00013", &rows[DEV_P_r].ta);
+    rows[DEV_P_r].key = "r";
+    rows[DEV_P_r].unit = "m";
+
+    createTableRow(scroll_obj, "l (cannula)", "Cannula length", "e.g. 0.012", &rows[DEV_P_l].ta);
+    rows[DEV_P_l].key = "l";
+    rows[DEV_P_l].unit = "m";
+
+    for (int i = 0; i < DEV_P_COUNT; i++) {
+        if (rows[i].ta) {
+            lv_textarea_set_text(rows[i].ta, param_store[i].saved_str);
+        }
+    }
+
+    lv_obj_t* btn_back = lv_btn_create(screen_obj);
+    lv_obj_set_size(btn_back, 160, 60);
+    lv_obj_set_style_bg_color(btn_back, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
+    lv_obj_align(btn_back, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+    lv_obj_add_event_cb(btn_back, backBtnEventCb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "BACK");
+    lv_obj_set_style_text_font(lbl_back, &montserrat_24, 0);
+    lv_obj_center(lbl_back);
+
+    lv_obj_t* btn_save = lv_btn_create(screen_obj);
+    lv_obj_set_size(btn_save, 160, 60);
+    lv_obj_align(btn_save, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_add_event_cb(btn_save, saveBtnEventCb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_save = lv_label_create(btn_save);
+    lv_label_set_text(lbl_save, "SAVE");
+    lv_obj_set_style_text_font(lbl_save, &montserrat_24, 0);
+    lv_obj_center(lbl_save);
+
+    lv_obj_t* btn_default = lv_btn_create(screen_obj);
+    lv_obj_set_size(btn_default, 160, 60);
+    lv_obj_align(btn_default, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
+    // lv_obj_add_event_cb(btn_default, [](lv_event_t* e){
+    //     LV_UNUSED(e);
+    //     resetParametersToDefault();
+    //     // showDefaultConfirmDialog();
+    // }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_event_cb(btn_default, [](lv_event_t* e){
+
+        LV_UNUSED(e);
+
+        if (kb_obj) lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+        kb_target_ta = NULL;
+
+        resetParametersToDefault();
+
+        lv_async_call([](void*){
+            showDoneDialog("Defaults Loaded");
+        }, NULL);
+
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_default = lv_label_create(btn_default);
+    lv_label_set_text(lbl_default, "DEFAULT");
+    lv_obj_set_style_text_font(lbl_default, &montserrat_24, 0);
+    lv_obj_center(lbl_default);
 }
 
 } // namespace CustomizedParametersScreen

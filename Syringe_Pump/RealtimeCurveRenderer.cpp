@@ -73,32 +73,24 @@ uint16_t RealtimeCurveRenderer::calculatePointCount(const Config& cfg)
         return cfg.point_count;
     }
 
-    // ⭐ 動態取得 chart width（更穩）
-    uint16_t width_px = 270;
-    if (s_volume_chart) {
-        width_px = lv_obj_get_width(s_volume_chart);
+    float duration_s = cfg.expected_duration_s;
+    if (duration_s <= 0.0f) {
+        duration_s = 10.0f;
     }
 
-    // ⭐ 留出 rendering margin（不要貼滿）
-    float fill_ratio = 0.85f;
-
-    uint16_t count = (uint16_t)(width_px * fill_ratio);
-
-    // ⭐ 根據 duration 做最低解析度保護
-    if (cfg.expected_duration_s > 0.0f) {
-        float min_dt = 0.05f; // 50 ms resolution
-        uint16_t duration_based = (uint16_t)(cfg.expected_duration_s / min_dt);
-
-        if (duration_based < count) {
-            count = duration_based;
-        }
+    uint32_t interval_ms = cfg.sample_interval_ms;
+    if (interval_ms < 20) {
+        interval_ms = 20;
     }
 
-    // clamp
+    // +1 ensures both t=0 and t=end can be represented.
+    uint32_t count =
+        (uint32_t)((duration_s * 1000.0f) / (float)interval_ms) + 1;
+
     if (count < MIN_POINTS) count = MIN_POINTS;
     if (count > MAX_POINTS) count = MAX_POINTS;
 
-    return count;
+    return (uint16_t)count;
 }
 
 bool RealtimeCurveRenderer::isInitialized()
@@ -375,8 +367,17 @@ void RealtimeCurveRenderer::pushSample(
     if (s_cfg.point_count < 2) return;
     if (s_cfg.expected_duration_s <= 0.0f) return;
 
+    if (!s_index_written) return;
+    if (s_allocated_point_count != s_cfg.point_count) return;
+
     if (t_s < 0.0f) t_s = 0.0f;
     if (t_s > s_cfg.expected_duration_s) t_s = s_cfg.expected_duration_s;
+
+    // INA228 measured current can be negative depending on wiring/shunt direction.
+    // For load monitoring display, plot magnitude.
+    if (current_A < 0.0f) {
+        current_A = -current_A;
+    }
 
     float ratio = t_s / s_cfg.expected_duration_s;
     if (ratio < 0.0f) ratio = 0.0f;
@@ -405,14 +406,20 @@ void RealtimeCurveRenderer::pushSample(
     }
 
     if (index > s_last_written_index) {
-        // fill only NEW indices
+        uint16_t newly_written = 0;
+
         for (uint16_t i = s_last_written_index + 1; i <= index; i++) {
             s_volume_series->y_points[i]  = y_volume;
             s_current_series->y_points[i] = y_current;
-            s_index_written[i] = true;
+
+            if (!s_index_written[i]) {
+                s_index_written[i] = true;
+                newly_written++;
+            }
         }
+
         s_last_written_index = index;
-        s_written_points++;
+        s_written_points += newly_written;
     }
     else if (index == s_last_written_index) {
         // do nothing: avoid overwriting the same point repeatedly

@@ -1,5 +1,4 @@
 #include "MotorControlScreen.h"
-#include "CustomizedParametersScreen.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -32,9 +31,54 @@ SPIClass &spi = SPI1;
 
 // leadscrew: 1.5 mm / rev
 static constexpr float LEADSCREW_MM_PER_REV = 1.5f;
+// TMC51X0's ControllerParameters store real-unit velocity and acceleration
+// as uint32_t before conversion. Therefore very small physical values such as
+// 0.007 mm/s may be truncated to zero if they are passed directly.
+//
+// POSITION_SCALE_FACTOR converts physical mm-based units into internal
+// controller units before they enter the TMC51X0 converter.
+// It is not only a distance calibration factor. It also preserves low-speed
+// and low-acceleration command resolution before integer truncation.
+//
+// Effective physical scale:
+// MICROSTEPS_PER_REAL_POSITION_UNIT * POSITION_SCALE_FACTOR
+// = TMC microsteps per physical mm.
+//
+// Example:
+// 1 microsteps/controller_unit * 35050 controller_units/mm
+// = 35050 microsteps/mm.
+//
+// Low-speed preservation:
+// 0.007 mm/s * 35050 = 245.35 controller_units/s,
+// which survives uint32_t truncation as 245 instead of becoming 0.
+static constexpr float MICROSTEPS_PER_REAL_POSITION_UNIT = 1.0f;
+// Adjustment: new_POSITION_SCALE_FACTOR = old_POSITION_SCALE_FACTOR * target_distance / actual_distance;
+static constexpr float POSITION_SCALE_FACTOR = 35050.0f;
 
-// 200 fullsteps/rev * (32 microsteps / 1.5 mm) ≈ 2133.33(Theoretical value)
-static constexpr float MICROSTEPS_PER_REAL_POSITION_UNIT = 3505.0f; // new coefficient = theoretical movement / actual movement
+// Allow tolerance between target movement & actual movement
+// 0.01 / 13 = 0.000769 mL = 0.769 µL (±0.077%)
+// 0.01 * 35050 = 350.5 microstep (tolerance = 350 microsteps -> safe range)
+static constexpr float POSITION_REACHED_TOLERANCE_MM = 0.01f;
+
+static inline float to_controller_distance_mm(float physical_mm)
+{
+    return physical_mm * POSITION_SCALE_FACTOR;
+}
+
+static inline float from_controller_distance_mm(float controller_mm)
+{
+    return controller_mm / POSITION_SCALE_FACTOR;
+}
+
+static inline float to_controller_velocity_mm_s(float physical_mm_s)
+{
+    return physical_mm_s * POSITION_SCALE_FACTOR;
+}
+
+static inline float to_controller_acceleration_mm_s2(float physical_mm_s2)
+{
+    return physical_mm_s2 * POSITION_SCALE_FACTOR;
+}
 
 // =========================
 // Runtime objects
@@ -47,7 +91,10 @@ lv_obj_t* screen_obj      = NULL;
 
 bool motor_spi_ready  = false;
 bool motor_is_running = false;
+bool motor_stop_ramping = false;
 bool moving_forward_phase = true;
+
+unsigned long motor_start_ms = 0;
 
 int32_t current_target_chip = 0;
 int32_t current_home_chip   = 0;
@@ -62,14 +109,14 @@ MotorControlScreen::MotorSpiSettings g_settings = {
     true,   // reverseDirection
     50.0f,  // stealthChopThreshold
 
-    5.0f,  // maxVelocity
-    5.0f,   // maxAcceleration
-    0.5f,   // startVelocity
-    0.5f,   // stopVelocity
-    1.0f,  // firstVelocity
-    2.0f,   // firstAcceleration
-    5.0f,   // maxDeceleration
-    2.0f,   // firstDeceleration
+    0.3f,  // maxVelocity
+    0.1f,   // maxAcceleration
+    0.0f,   // startVelocity
+    0.01f,   // stopVelocity
+    0.1f,  // firstVelocity
+    0.1f,   // firstAcceleration
+    0.1f,   // maxDeceleration
+    0.1f,   // firstDeceleration
 
     MotorControlScreen::MODE_REVOLUTIONS, // mode
     1.0f,   // forwardValue
@@ -161,6 +208,40 @@ void set_status_fmt(const char* fmt, ...)
     va_end(args);
 
     lv_label_set_text(lbl_status, buf);
+}
+
+bool target_reached_internal()
+{
+    if (!motor_spi_ready) {
+        return true;
+    }
+
+    // Avoid reading stale positionReached immediately after target update.
+    if ((millis() - motor_start_ms) < 300) {
+        return false;
+    }
+
+    if (stepper.controller.positionReached()) {
+        return true;
+    }
+
+    int32_t actual_chip = stepper.controller.readActualPosition();
+
+    int32_t diff_chip =
+        (actual_chip >= current_target_chip)
+        ? (actual_chip - current_target_chip)
+        : (current_target_chip - actual_chip);
+
+    int32_t tolerance_chip =
+        stepper.converter.positionRealToChip(
+            to_controller_distance_mm(POSITION_REACHED_TOLERANCE_MM)
+        );
+
+    if (tolerance_chip < 1) {
+        tolerance_chip = 1;
+    }
+
+    return diff_chip <= tolerance_chip;
 }
 
 // =========================
@@ -296,17 +377,17 @@ void push_settings_to_ui_internal()
     set_ta_float(ta_pwmGradient,       g_settings.pwmGradientPercent, 0);
     set_ta_float(ta_stealthThreshold,  g_settings.stealthChopThreshold, 1);
 
-    set_ta_float(ta_maxVelocity,       g_settings.maxVelocity, 2);
-    set_ta_float(ta_maxAcceleration,   g_settings.maxAcceleration, 2);
-    set_ta_float(ta_startVelocity,     g_settings.startVelocity, 2);
-    set_ta_float(ta_stopVelocity,      g_settings.stopVelocity, 2);
-    set_ta_float(ta_firstVelocity,     g_settings.firstVelocity, 2);
-    set_ta_float(ta_firstAcceleration, g_settings.firstAcceleration, 2);
-    set_ta_float(ta_maxDeceleration,   g_settings.maxDeceleration, 2);
-    set_ta_float(ta_firstDeceleration, g_settings.firstDeceleration, 2);
+    set_ta_float(ta_maxVelocity,       g_settings.maxVelocity, 4);
+    set_ta_float(ta_maxAcceleration,   g_settings.maxAcceleration, 4);
+    set_ta_float(ta_startVelocity,     g_settings.startVelocity, 4);
+    set_ta_float(ta_stopVelocity,      g_settings.stopVelocity, 4);
+    set_ta_float(ta_firstVelocity,     g_settings.firstVelocity, 4);
+    set_ta_float(ta_firstAcceleration, g_settings.firstAcceleration, 4);
+    set_ta_float(ta_maxDeceleration,   g_settings.maxDeceleration, 4);
+    set_ta_float(ta_firstDeceleration, g_settings.firstDeceleration, 4);
 
-    set_ta_float(ta_forwardValue,      g_settings.forwardValue, 2);
-    set_ta_float(ta_backwardValue,     g_settings.backwardValue, 2);
+    set_ta_float(ta_forwardValue,      g_settings.forwardValue, 3);
+    set_ta_float(ta_backwardValue,     g_settings.backwardValue, 3);
 
     if (dd_direction) {
         lv_dropdown_set_selected(dd_direction, g_settings.reverseDirection ? 1 : 0);
@@ -363,19 +444,37 @@ bool init_motor_spi_system_internal()
             .withPwmOffset((uint8_t)g_settings.pwmOffsetPercent)
             .withPwmGradient((uint8_t)g_settings.pwmGradientPercent)
             .withMotorDirection(tmc51x0::ForwardDirection)
-            .withStealthChopThreshold(g_settings.stealthChopThreshold);
+            .withStealthChopThreshold(
+                to_controller_velocity_mm_s(g_settings.stealthChopThreshold)
+            );
 
     auto controller_parameters_real =
         tmc51x0::ControllerParameters{}
             .withRampMode(tmc51x0::PositionMode)
-            .withMaxVelocity(g_settings.maxVelocity)
-            .withMaxAcceleration(g_settings.maxAcceleration)
-            .withStartVelocity(g_settings.startVelocity)
-            .withStopVelocity(g_settings.stopVelocity)
-            .withFirstVelocity(g_settings.firstVelocity)
-            .withFirstAcceleration(g_settings.firstAcceleration)
-            .withMaxDeceleration(g_settings.maxDeceleration)
-            .withFirstDeceleration(g_settings.firstDeceleration);
+            .withMaxVelocity(
+                to_controller_velocity_mm_s(g_settings.maxVelocity)
+            )
+            .withMaxAcceleration(
+                to_controller_acceleration_mm_s2(g_settings.maxAcceleration)
+            )
+            .withStartVelocity(
+                to_controller_velocity_mm_s(g_settings.startVelocity)
+            )
+            .withStopVelocity(
+                to_controller_velocity_mm_s(g_settings.stopVelocity)
+            )
+            .withFirstVelocity(
+                to_controller_velocity_mm_s(g_settings.firstVelocity)
+            )
+            .withFirstAcceleration(
+                to_controller_acceleration_mm_s2(g_settings.firstAcceleration)
+            )
+            .withMaxDeceleration(
+                to_controller_acceleration_mm_s2(g_settings.maxDeceleration)
+            )
+            .withFirstDeceleration(
+                to_controller_acceleration_mm_s2(g_settings.firstDeceleration)
+            );
 
     spi.begin();
 
@@ -419,6 +518,9 @@ bool init_motor_spi_system_internal()
 
     current_home_chip = 0;
     moving_forward_phase = true;
+
+    motor_is_running = false;
+    motor_stop_ramping = false;
     motor_spi_ready = true;
 
     set_status("SPI ready");
@@ -433,17 +535,18 @@ int32_t compute_target_chip_from_mode_internal(
     MotorControlScreen::MotionInputMode mode
 )
 {
-    float target_mm = 0.0f;
-    // for motor calibration
-    float scale_factor = 10.0f;
+    float physical_target_mm = 0.0f;
 
     if (mode == MotorControlScreen::MODE_DISTANCE_MM) {
-        target_mm = value * scale_factor;
+        physical_target_mm = value;
     } else {
-        target_mm = value * LEADSCREW_MM_PER_REV * scale_factor;
+        physical_target_mm = value * LEADSCREW_MM_PER_REV;
     }
 
-    return stepper.converter.positionRealToChip(target_mm);
+    const float controller_target_mm =
+        to_controller_distance_mm(physical_target_mm);
+
+    return stepper.converter.positionRealToChip(controller_target_mm);
 }
 
 void start_motion_internal()
@@ -469,28 +572,63 @@ void start_motion_internal()
     current_target_chip = target;
     stepper.controller.writeTargetPosition(current_target_chip);
 
+    motor_start_ms = millis();
+
     motor_is_running = true;
-    moving_forward_phase = false; // 不再使用來回模式
+    motor_stop_ramping = false;
+    moving_forward_phase = false;
 
     set_status("Moving");
 }
 
 void stop_motion_internal()
 {
-    motor_is_running = false;
-
-    if (motor_spi_ready) {
-        stepper.controller.beginRampToZeroVelocity();
+    if (!motor_spi_ready) {
+        motor_is_running = false;
+        motor_stop_ramping = false;
+        set_status("Stopped");
+        return;
     }
 
-    set_status("Stopped");
+    if (!motor_is_running && !motor_stop_ramping) {
+        set_status("Stopped");
+        return;
+    }
+
+    stepper.controller.beginRampToZeroVelocity();
+
+    motor_is_running = true;
+    motor_stop_ramping = true;
+
+    set_status("Stopping");
 }
 
 void update_spi_motion_internal()
 {
-    if (!motor_is_running || !motor_spi_ready) return;
+    if (!motor_spi_ready) return;
 
-    if (stepper.controller.positionReached()) {
+    if (!motor_is_running && !motor_stop_ramping) return;
+
+    if (motor_stop_ramping) {
+        float current_mA = ina228.getCurrent_mA();
+        int32_t actual_pos_chip = stepper.controller.readActualPosition();
+        float controller_pos_mm =
+            stepper.converter.positionChipToReal(actual_pos_chip);
+
+        float physical_pos_mm =
+            from_controller_distance_mm(controller_pos_mm);
+
+        set_status_fmt(
+            "Stopping\nPos = %.2f mm\nI = %.2f mA",
+            physical_pos_mm,
+            current_mA
+        );
+        return;
+    }
+
+    if (!motor_is_running) return;
+
+    if (target_reached_internal()) {
         motor_is_running = false;
         set_status("Done");
         return;
@@ -501,11 +639,15 @@ void update_spi_motion_internal()
     float temp_C     = ina228.readDieTemp();
 
     int32_t actual_pos_chip = stepper.controller.readActualPosition();
-    float actual_pos_mm = stepper.converter.positionChipToReal(actual_pos_chip);
+    float controller_pos_mm =
+        stepper.converter.positionChipToReal(actual_pos_chip);
+
+    float physical_pos_mm =
+        from_controller_distance_mm(controller_pos_mm);
 
     set_status_fmt(
         "Run \nPos = %.2f mm \nI = %.2f mA \nV = %.2f V \nT = %.2f C",
-        actual_pos_mm / 10,
+        physical_pos_mm,
         current_mA,
         voltage_V,
         temp_C
@@ -741,6 +883,8 @@ void destroy()
     moving_forward_phase = true;
     current_target_chip = 0;
     current_home_chip = 0;
+    motor_stop_ramping = false;
+    motor_start_ms = 0;
 }
 
 void destroyAsync(void* user_data)
@@ -768,14 +912,14 @@ void resetSettingsToDefault()
         15.0f,
         true,
         50.0f,
-        5.0f,
-        5.0f,
-        0.5f,
-        0.5f,
-        1.0f,
-        2.0f,
-        5.0f,
-        2.0f,
+        0.3f,
+        0.1f,
+        0.0f,
+        0.001f,
+        0.1f,
+        0.05f,
+        0.1f,
+        0.05f,
         MODE_REVOLUTIONS,
         1.0f,
         1.0f
@@ -824,35 +968,92 @@ bool isRunning()
 // =========================
 // Start Single Move
 // =========================
-bool startSingleMove(float quantity_uL, float stroke_per_ml_mm)
+bool startExtrusionMove(const TmcRampCommand& cmd)
 {
-    if (quantity_uL <= 0.0f || stroke_per_ml_mm <= 0.0f) {
+    if (motor_is_running || motor_stop_ramping) {
+        set_status("Motion busy");
         return false;
     }
 
+    if (!cmd.valid) {
+        set_status("Invalid ramp command");
+        return false;
+    }
+
+    if (cmd.target_distance_mm <= 0.0f) {
+        set_status("Invalid target distance");
+        return false;
+    }
+
+    if (cmd.max_velocity_mm_s <= 0.0f) {
+        set_status("Invalid max velocity");
+        return false;
+    }
+
+    if (cmd.max_acceleration_mm_s2 <= 0.0f ||
+        cmd.max_deceleration_mm_s2 <= 0.0f) {
+        set_status("Invalid acceleration");
+        return false;
+    }
+
+    if (cmd.start_velocity_mm_s < 0.0f ||
+        cmd.stop_velocity_mm_s < 0.0f ||
+        cmd.first_velocity_mm_s < 0.0f) {
+        set_status("Invalid ramp velocity");
+        return false;
+    }
+
+    if (cmd.first_acceleration_mm_s2 <= 0.0f ||
+        cmd.first_deceleration_mm_s2 <= 0.0f) {
+        set_status("Invalid first ramp acceleration");
+        return false;
+    }
+
+    // Pull driver-level settings from UI first.
+    // Then override motion ramp settings using planner output.
     pull_settings_from_ui_internal();
+
+    g_settings.maxVelocity       = cmd.max_velocity_mm_s;
+    g_settings.maxAcceleration   = cmd.max_acceleration_mm_s2;
+    g_settings.maxDeceleration   = cmd.max_deceleration_mm_s2;
+
+    g_settings.startVelocity = cmd.start_velocity_mm_s;
+
+    float safe_stop_velocity = 0.001f;
+
+    if (safe_stop_velocity >= cmd.max_velocity_mm_s) {
+        safe_stop_velocity = cmd.max_velocity_mm_s * 0.5f;
+    }
+
+    g_settings.stopVelocity =
+        (cmd.stop_velocity_mm_s > 0.0f)
+        ? cmd.stop_velocity_mm_s
+        : safe_stop_velocity;
+
+    g_settings.firstVelocity = cmd.first_velocity_mm_s;
+
+    g_settings.firstAcceleration =
+        (cmd.first_acceleration_mm_s2 > 0.0f)
+        ? cmd.first_acceleration_mm_s2
+        : 0.005f;
+
+    g_settings.firstDeceleration =
+        (cmd.first_deceleration_mm_s2 > 0.0f)
+        ? cmd.first_deceleration_mm_s2
+        : 0.005f;
+
+    g_settings.reverseDirection  = cmd.reverse_direction;
 
     if (!init_motor_spi_system_internal()) {
         return false;
     }
 
-    // uL -> mL -> mm
-    const float quantity_mL = quantity_uL / 1000.0f;
-    const float target_mm = quantity_mL * stroke_per_ml_mm;
-
-    if (target_mm <= 0.0f) {
-        return false;
-    }
-
     int32_t target_chip =
         compute_target_chip_from_mode_internal(
-            target_mm,
+            cmd.target_distance_mm,
             MODE_DISTANCE_MM
         );
 
-    // Direction dropdown:
-    // 0 = Forward
-    // 1 = Reverse
     if (g_settings.reverseDirection) {
         target_chip = -target_chip;
     }
@@ -860,8 +1061,12 @@ bool startSingleMove(float quantity_uL, float stroke_per_ml_mm)
     current_target_chip = target_chip;
     stepper.controller.writeTargetPosition(current_target_chip);
 
+    motor_start_ms = millis();
+
     motor_is_running = true;
-    set_status("Low viscosity move");
+    motor_stop_ramping = false;
+
+    set_status("Extrusion move");
 
     return true;
 }
@@ -870,9 +1075,23 @@ bool motionFinished()
 {
     if (!motor_spi_ready) return true;
 
-    if (!motor_is_running) return true;
+    if (!motor_is_running && !motor_stop_ramping) {
+        return true;
+    }
 
-    if (stepper.controller.positionReached()) {
+    if (motor_stop_ramping) {
+        if (stepper.controller.zeroVelocity()) {
+            stepper.controller.endRampToZeroVelocity();
+            motor_stop_ramping = false;
+            motor_is_running = false;
+            set_status("Stopped");
+            return true;
+        }
+
+        return false;
+    }
+
+    if (target_reached_internal()) {
         motor_is_running = false;
         set_status("Done");
         return true;

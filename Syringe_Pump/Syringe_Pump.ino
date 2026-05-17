@@ -10,18 +10,17 @@
 #include "images.h"
 #include "FlowConstraintModel.h"
 #include "PlungerMotionPlanner.h"
+#include "TmcExecutableRampPlanner.h"
 #include "RealtimeCurveRenderer.h"
 #include "MotorControlScreen.h"
-#include "PlungerSpiPositionStreamer.h"
 #include "CustomizedParametersScreen.h"
 #include "MotionModeManager.h"
 
-using namespace PlungerSpiPositionStreamerNS;
+// ====== For Planner Value Monitor =====
+#define DEBUG_PLANNER 1
+// ======================================
 
 // --- Global Variables ---
-// --- SPI Real Control ---
-static PlungerSpiPositionStreamer realtime_streamer;
-static bool realtime_streamer_valid = false;
 // struct put before all function
 typedef struct{
   const char** keymap;          // keypad layout
@@ -137,6 +136,11 @@ static lv_obj_t* btn_tab3_motor_control = NULL;
 static PlungerMotionPlanner realtime_motion_planner;
 static bool realtime_motion_planner_valid = false;
 
+// TMC executable ramp planner
+static TmcExecutableRampPlanner tmc_executable_planner;
+static bool tmc_executable_planner_valid = false;
+static TmcRampCommand g_tmc_ramp_cmd;
+
 static float realtime_curve_volume_max_uL = 1000.0f;
 static float realtime_curve_current_max_A = 3.0f;
 
@@ -144,13 +148,10 @@ static unsigned long last_curve_update_ms = 0;
 // --- Global Variables ---
 input_block_t* viscosity_block;
 input_block_t* quantity_block;
-// --- Viscosity Threshold ---
-static constexpr float LOW_VISCOSITY_THRESHOLD_MPA_S = 100.0f;
-static bool low_viscosity_mode_active = false;
+// --- Stop request state ---
 static bool stop_requested = false;
-static bool low_viscosity_timeout = false;
+static bool stop_requested_by_timeout = false;
 static unsigned long stop_request_ms = 0;
-
 
 typedef struct {
     const char* key;
@@ -192,116 +193,55 @@ void lv_initial_tabview(void){
 }
 // --------------------------------------
 
-static float predict_low_viscosity_duration(float quantity_uL)
-{
-    MotorControlScreen::pullSettingsFromUi();
-
-    float stroke_per_ml =
-        CustomizedParametersScreen::getSavedFloat(
-            CustomizedParametersScreen::DEV_P_STROKE_PER_ML_MM
-        );
-
-    float vmax =
-        MotorControlScreen::getSettings().maxVelocity;
-
-    if (stroke_per_ml <= 0.0f) stroke_per_ml = 13.0f;
-    if (vmax <= 0.01f) vmax = 1.0f;
-
-    float quantity_ml = quantity_uL / 1000.0f;
-    float move_mm = quantity_ml * stroke_per_ml;
-
-    float t = move_mm / vmax;
-
-    // rough acceleration allowance
-    t *= 1.15f;
-
-    if (t < 0.5f) t = 0.5f;
-
-    return t;
-}
-
 // --- START / STOP Button ---
 static void start_btn_event_cb(lv_event_t* e)
 {
     lv_obj_t* btn = lv_event_get_target(e);
 
     if (!is_running) {
-        // 嘗試抓取設定
         fetch_setting_values();
 
         if (!recorded_viscosity) {
             show_missing_param_dialog("Missing liquid viscosity");
             return;
         }
+
         if (!recorded_quantity) {
             show_missing_param_dialog("Missing extrusion quantity");
             return;
         }
 
         float viscosity_value = atof(recorded_viscosity);
-        low_viscosity_mode_active = (viscosity_value <= LOW_VISCOSITY_THRESHOLD_MPA_S);
+        float quantity_value  = atof(recorded_quantity);
 
-        if (low_viscosity_mode_active) {
-            // Low viscosity: use TMC internal ramp, no precision planner, no SPI streamer
-            auto tr = MotionModeManager::requestScenario(
-                MotionModeManager::SCENARIO_LOW_VISCOSITY_EXTRUSION
-            );
-
-            if (!tr.success) {
-                show_missing_param_dialog(tr.message);
-                return;
-            }
-
-            // Temporary simple duration estimate
-            // Later you can replace this with TMC ramp duration calculation
-            float q = atof(recorded_quantity);
-
-            recorded_duration_sec_exact =
-                predict_low_viscosity_duration(q);
-
-            recorded_duration_sec = (int)(recorded_duration_sec_exact + 0.5f);
-
-            if (recorded_duration_sec < 1) {
-                recorded_duration_sec = 1;
-            }
-            recorded_duration_valid = true;
-            realtime_curve_volume_max_uL = q;
-            
-            if (realtime_curve_volume_max_uL < 1.0f) {
-                realtime_curve_volume_max_uL = 1.0f;
-            }
-            realtime_motion_planner_valid = false;
-            realtime_streamer_valid = false;
-
-            show_start_confirm_dialog(btn);
+        if (viscosity_value <= 0.0f) {
+            show_missing_param_dialog("Invalid liquid viscosity");
+            return;
         }
-        else {
-            auto tr = MotionModeManager::requestScenario(
-                MotionModeManager::SCENARIO_EXTRUSION_ACTIVE
-            );
 
-            if (!tr.success) {
-                show_missing_param_dialog(tr.message);
-                return;
-            }
-
-            if (!calculate_predicted_duration()) {
-                MotionModeManager::forceIdle("Failed to build motion planner");
-                show_missing_param_dialog("Failed to build motion planner");
-                return;
-            }
-
-            if (!build_realtime_spi_streamer_from_current_settings()) {
-                MotionModeManager::forceIdle("Failed to initialize SPI control");
-                show_missing_param_dialog("Failed to initialize SPI control");
-                return;
-            }
-
-            show_start_confirm_dialog(btn);
+        if (quantity_value <= 0.0f) {
+            show_missing_param_dialog("Invalid extrusion quantity");
+            return;
         }
+
+        auto tr = MotionModeManager::requestScenario(
+            MotionModeManager::SCENARIO_EXTRUSION_ACTIVE
+        );
+
+        if (!tr.success) {
+            show_missing_param_dialog(tr.message);
+            return;
+        }
+
+        if (!calculate_predicted_duration()) {
+            MotionModeManager::forceIdle("Failed to build extrusion planner");
+            show_missing_param_dialog("Failed to build extrusion planner");
+            return;
+        }
+
+        show_start_confirm_dialog(btn);
     }
     else {
-        // STOP → reuse existing stop confirm
         show_confirm_dialog(btn, tab1);
     }
 }
@@ -361,66 +301,28 @@ void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
     // YES event
     lv_obj_add_event_cb(btn_yes, [](lv_event_t* e){
 
-        if (low_viscosity_mode_active)
-        {
-            MotorControlScreen::stopMotion();
-            stop_requested = true;
-            stop_request_ms = millis();
+        LV_UNUSED(e);
 
+        auto tr = MotionModeManager::requestScenario(
+            MotionModeManager::SCENARIO_EXTRUSION_STOPPING
+        );
+
+        if (!tr.success) {
+            MotionModeManager::forceIdle("User stop requested");
+        }
+
+        MotorControlScreen::stopMotion();
+
+        stop_requested = true;
+        stop_requested_by_timeout = false;
+        stop_request_ms = millis();
+
+        if (confirm_dialog) {
             lv_obj_del(confirm_dialog);
             confirm_dialog = NULL;
-
-            return;
         }
 
-        // High viscosity / SPI streaming stop
-        is_running = false;
-
-        if (realtime_streamer_valid && realtime_streamer.isRunning()) {
-            realtime_streamer.stop(true);
-        }
-
-        MotionModeManager::forceIdle("User stopped operation");
-
-        set_tab3_control_buttons_enabled(true);
-
-        if (realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
-            float t_s = (millis() - run_start_ms) / 1000.0f;
-
-            if (t_s > recorded_duration_sec_exact) {
-                t_s = recorded_duration_sec_exact;
-            }
-
-            PlungerMotionPlanner::Sample sample =
-                realtime_motion_planner.evaluate(t_s);
-
-            RealtimeCurveRenderer::pushSample(
-                t_s,
-                sample.volume,
-                sample.currentEst
-            );
-
-            RealtimeCurveRenderer::releaseTempData();
-        }
-
-        realtime_motion_planner_valid = false;
-        realtime_streamer_valid = false;
-        recorded_duration_valid = false;
-
-        clear_countdown_dialog();
-
-        lv_obj_t* btn = (lv_obj_t*)lv_event_get_user_data(e);
-        lv_obj_t* label = lv_obj_get_child(btn, 0);
-
-        lv_label_set_text(label, "START");
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x0000FF), 0);
-
-        lv_obj_del(confirm_dialog);
-        confirm_dialog = NULL;
-
-        show_finish_dialog();
-
-    }, LV_EVENT_CLICKED, btn);
+    }, LV_EVENT_CLICKED, NULL);
     // NO event
     lv_obj_add_event_cb(btn_no, [](lv_event_t*){
         lv_obj_del(confirm_dialog);
@@ -529,54 +431,46 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         lv_obj_t* btn = (lv_obj_t*)lv_event_get_user_data(e);
         lv_obj_t* label = lv_obj_get_child(btn, 0);
 
+        // 先檢查 command
+        if (!tmc_executable_planner_valid || !g_tmc_ramp_cmd.valid)
+        {
+            MotionModeManager::forceIdle("Invalid TMC ramp command");
+
+            lv_obj_del(confirm_dialog);
+            confirm_dialog = NULL;
+
+            show_missing_param_dialog("Invalid TMC ramp command");
+            return;
+        }
+
+        // 再啟動 motor
+        if (!MotorControlScreen::startExtrusionMove(g_tmc_ramp_cmd))
+        {
+            MotionModeManager::forceIdle("Extrusion start failed");
+
+            lv_obj_del(confirm_dialog);
+            confirm_dialog = NULL;
+
+            show_missing_param_dialog("Extrusion start failed");
+            return;
+        }
+
+        // motor start 成功後，才進入 running state
+        stop_requested = false;
+        stop_requested_by_timeout = false;
+
         is_running = true;
-        run_start_ms = millis();   // ✅ 記錄開始時間
+        run_start_ms = millis();
         last_curve_update_ms = 0;
         set_tab3_control_buttons_enabled(false);
 
-        if (low_viscosity_mode_active)
-        {
-            float q = atof(recorded_quantity);
-
-            float stroke_per_ml =
-                CustomizedParametersScreen::getSavedFloat(
-                    CustomizedParametersScreen::DEV_P_STROKE_PER_ML_MM
-                );
-
-            if (!MotorControlScreen::startSingleMove(q, stroke_per_ml))
-            {
-                is_running = false;
-                MotionModeManager::forceIdle("Low viscosity start failed");
-                low_viscosity_mode_active = false;
-
-                lv_obj_del(confirm_dialog);
-                confirm_dialog = NULL;
-
-                show_missing_param_dialog("Low viscosity start failed");
-                return;
-            }
-
-            realtime_streamer_valid = false;
-            realtime_motion_planner_valid = false;
-        }
-        else {
-            if (realtime_streamer_valid) {
-                if (!realtime_streamer.start(true)) {
-                    is_running = false;
-                    MotionModeManager::forceIdle("Failed to start SPI streaming");
-                    show_missing_param_dialog("Failed to start SPI streaming");
-                    return;
-                }
-            }
-        }
-
-        // reset charts using current theoretical range
+        // reset charts using executable motion range
         RealtimeCurveRenderer::Config curve_cfg;
         curve_cfg.expected_duration_s = recorded_duration_sec_exact;
-        curve_cfg.sample_interval_ms  = 100;   // 1 point per second
+        curve_cfg.sample_interval_ms  = 100;   // one point every 100 ms
         curve_cfg.point_count         = 0;      // auto-calc
-        curve_cfg.volume_max_uL       = realtime_curve_volume_max_uL * 1.05f; // chart Y axis range
-        curve_cfg.current_max_A       = 5; // chart Y axis range
+        curve_cfg.volume_max_uL       = realtime_curve_volume_max_uL * 1.1f; // chart Y axis range
+        curve_cfg.current_max_A       = realtime_curve_current_max_A; // chart Y axis range
 
         if (curve_cfg.volume_max_uL < 1.0f) {
             curve_cfg.volume_max_uL = 1.0f;
@@ -591,13 +485,14 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         show_countdown_dialog(recorded_duration_sec, tab1);
 
         // ✅ 強制第一點
-        if (realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
-            PlungerMotionPlanner::Sample s0 = realtime_motion_planner.evaluate(0.0f);
+        if (tmc_executable_planner_valid && RealtimeCurveRenderer::isInitialized()) {
+            TmcExecutableRampPlanner::Sample s0 =
+                tmc_executable_planner.evaluate(0.0f);
 
             RealtimeCurveRenderer::pushSample(
                 0.0f,
-                s0.volume,
-                s0.currentEst
+                s0.volume_uL,
+                MotorControlScreen::getMeasuredCurrentA()
             );
         }
 
@@ -611,10 +506,13 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
     // NO → cancel
     lv_obj_add_event_cb(btn_no, [](lv_event_t*){
         MotionModeManager::forceIdle("User cancelled start");
-        low_viscosity_mode_active = false;
-        realtime_streamer_valid = false;
+
         realtime_motion_planner_valid = false;
+        tmc_executable_planner_valid = false;
+        g_tmc_ramp_cmd = TmcRampCommand();
+
         recorded_duration_valid = false;
+
         lv_obj_del(confirm_dialog);
         confirm_dialog = NULL;
     }, LV_EVENT_CLICKED, NULL);
@@ -1574,7 +1472,16 @@ static bool calculate_predicted_duration()
         return false;
     }
 
-    recorded_duration_sec_exact = realtime_motion_planner.totalDuration();
+    if (!tmc_executable_planner_valid || !g_tmc_ramp_cmd.valid) {
+        return false;
+    }
+
+    // Use the TMC-executable duration, not the ideal planner duration.
+    recorded_duration_sec_exact = g_tmc_ramp_cmd.expected_duration_s;
+
+    if (recorded_duration_sec_exact <= 0.0f) {
+        return false;
+    }
 
     recorded_duration_sec = (int)(recorded_duration_sec_exact + 0.5f);
     if (recorded_duration_sec < 1) {
@@ -1585,9 +1492,256 @@ static bool calculate_predicted_duration()
     return true;
 }
 
+// ====== For Planner Value Monitor =====
+#if DEBUG_PLANNER
+
+static void print_flow_params(const FlowConstraintModel::Params& p)
+{
+    Serial.println("========== FLOW PARAMS ==========");
+
+    Serial.print("viscosity_mPa_s = ");
+    Serial.println(p.viscosity, 6);
+
+    Serial.print("R = ");
+    Serial.println(p.R, 9);
+
+    Serial.print("L = ");
+    Serial.println(p.L, 9);
+
+    Serial.print("shaft = ");
+    Serial.println(p.shaft, 9);
+
+    Serial.print("shaft_walls = ");
+    Serial.println(p.shaft_walls, 9);
+
+    Serial.print("E = ");
+    Serial.println(p.E, 6);
+
+    Serial.print("S = ");
+    Serial.println(p.S, 6);
+
+    Serial.print("needle_r = ");
+    Serial.println(p.r, 9);
+
+    Serial.print("needle_l = ");
+    Serial.println(p.l, 9);
+
+    Serial.print("lead_pitch = ");
+    Serial.println(p.lead_pitch, 9);
+
+    Serial.print("I_limit = ");
+    Serial.println(p.I_limit, 6);
+
+    Serial.print("stroke_per_ml_mm = ");
+    Serial.println(p.stroke_per_ml_mm, 6);
+
+    Serial.print("max_linear_speed_mm_s = ");
+    Serial.println(p.max_linear_speed_mm_s, 6);
+
+    Serial.print("I_plunger = ");
+    Serial.println(p.I_plunger, 12);
+
+    Serial.print("moving_mass_kg = ");
+    Serial.println(p.moving_mass_kg, 6);
+
+    Serial.print("friction_force_N = ");
+    Serial.println(p.friction_force_N, 6);
+
+    Serial.print("acceleration_utilization = ");
+    Serial.println(p.acceleration_utilization, 6);
+
+    Serial.print("use_load_terms_for_accel = ");
+    Serial.println(p.use_load_terms_for_accel ? "true" : "false");
+
+    Serial.print("eta = ");
+    Serial.println(p.eta, 6);
+
+    Serial.print("Kt = ");
+    Serial.println(p.Kt, 6);
+
+    Serial.print("max_rpm = ");
+    Serial.println(p.max_rpm, 6);
+
+    Serial.print("steps_per_rev = ");
+    Serial.println(p.steps_per_rev, 6);
+
+    Serial.print("max_step_freq = ");
+    Serial.println(p.max_step_freq, 6);
+
+    Serial.print("beta = ");
+    Serial.println(p.beta, 6);
+
+    Serial.print("K_buckling = ");
+    Serial.println(p.K_buckling, 6);
+
+    Serial.println("=================================");
+}
+
+static void print_flow_result(const FlowConstraintModel::Result& r)
+{
+    Serial.println("========== FLOW RESULT ==========");
+
+    Serial.print("valid = ");
+    Serial.println(r.valid ? "true" : "false");
+
+    Serial.print("A_m2 = ");
+    Serial.println(r.A, 12);
+
+    Serial.print("mu_Pa_s = ");
+    Serial.println(r.mu, 9);
+
+    Serial.print("I_used = ");
+    Serial.println(r.I_used, 12);
+
+    Serial.print("F_crit_N = ");
+    Serial.println(r.F_crit, 6);
+
+    Serial.print("F_allow_N = ");
+    Serial.println(r.F_allow, 6);
+
+    Serial.print("F_motor_N = ");
+    Serial.println(r.F_motor, 6);
+
+    Serial.print("dP_motor_Pa = ");
+    Serial.println(r.dP_motor, 6);
+
+    Serial.print("F_capacity_N = ");
+    Serial.println(r.F_capacity, 6);
+
+    Serial.print("F_pressure_at_Q_allow_N = ");
+    Serial.println(r.F_pressure_at_Q_allow, 6);
+
+    Serial.print("F_friction_used_N = ");
+    Serial.println(r.F_friction_used, 6);
+
+    Serial.print("F_accel_available_N = ");
+    Serial.println(r.F_accel_available, 6);
+
+    Serial.print("moving_mass_kg = ");
+    Serial.println(r.moving_mass_kg, 6);
+
+    Serial.print("a_allow_m_s2 = ");
+    Serial.println(r.a_allow_m_s2, 6);
+
+    Serial.print("a_allow_mm_s2 = ");
+    Serial.println(r.a_allow_mm_s2, 6);
+
+    Serial.print("Q_struct_m3_s = ");
+    Serial.println(r.Q_struct, 12);
+
+    Serial.print("Q_motor_m3_s = ");
+    Serial.println(r.Q_motor, 12);
+
+    Serial.print("Q_rpm_m3_s = ");
+    Serial.println(r.Q_rpm, 12);
+
+    Serial.print("Q_step_m3_s = ");
+    Serial.println(r.Q_step, 12);
+
+    Serial.print("Q_force_safe_m3_s = ");
+    Serial.println(r.Q_force_safe, 12);
+
+    Serial.print("Q_speed_safe_m3_s = ");
+    Serial.println(r.Q_speed_safe, 12);
+
+    Serial.print("Q_allow_m3_s = ");
+    Serial.println(r.Q_allow, 12);
+
+    Serial.print("Q_allow_uL_s = ");
+    Serial.println(r.Q_allow * 1.0e9f, 6);
+
+    Serial.print("v_allow_mm_s = ");
+    Serial.println(r.v_allow * 1000.0f, 6);
+
+    Serial.println("=================================");
+}
+
+static void print_ideal_planner(const PlungerMotionPlanner& planner)
+{
+    Serial.println("========== IDEAL PLANNER ==========");
+
+    Serial.print("target_volume_m3 = ");
+    Serial.println(planner.getTargetVolume_m3(), 12);
+
+    Serial.print("target_volume_uL = ");
+    Serial.println(planner.getTargetVolume_m3() * 1.0e9f, 6);
+
+    Serial.print("target_stroke_m = ");
+    Serial.println(planner.getTargetStroke_m(), 12);
+
+    Serial.print("target_stroke_mm = ");
+    Serial.println(planner.getTargetStroke_m() * 1000.0f, 6);
+
+    Serial.print("ideal_total_duration_s = ");
+    Serial.println(planner.totalDuration(), 6);
+
+    Serial.print("ideal_peak_velocity_mm_s = ");
+    Serial.println(planner.getPeakVelocity_mps() * 1000.0f, 6);
+
+    Serial.print("area_m2 = ");
+    Serial.println(planner.getArea_m2(), 12);
+
+    Serial.println("===================================");
+}
+
+static void print_tmc_command(const TmcRampCommand& cmd)
+{
+    Serial.println("========== TMC RAMP COMMAND ==========");
+
+    Serial.print("valid = ");
+    Serial.println(cmd.valid ? "true" : "false");
+
+    Serial.print("quantity_uL = ");
+    Serial.println(cmd.quantity_uL, 6);
+
+    Serial.print("stroke_per_ml_mm = ");
+    Serial.println(cmd.stroke_per_ml_mm, 6);
+
+    Serial.print("target_distance_mm = ");
+    Serial.println(cmd.target_distance_mm, 6);
+
+    Serial.print("max_velocity_mm_s = ");
+    Serial.println(cmd.max_velocity_mm_s, 6);
+
+    Serial.print("max_acceleration_mm_s2 = ");
+    Serial.println(cmd.max_acceleration_mm_s2, 6);
+
+    Serial.print("max_deceleration_mm_s2 = ");
+    Serial.println(cmd.max_deceleration_mm_s2, 6);
+
+    Serial.print("start_velocity_mm_s = ");
+    Serial.println(cmd.start_velocity_mm_s, 6);
+
+    Serial.print("stop_velocity_mm_s = ");
+    Serial.println(cmd.stop_velocity_mm_s, 6);
+
+    Serial.print("first_velocity_mm_s = ");
+    Serial.println(cmd.first_velocity_mm_s, 6);
+
+    Serial.print("first_acceleration_mm_s2 = ");
+    Serial.println(cmd.first_acceleration_mm_s2, 6);
+
+    Serial.print("first_deceleration_mm_s2 = ");
+    Serial.println(cmd.first_deceleration_mm_s2, 6);
+
+    Serial.print("expected_duration_s = ");
+    Serial.println(cmd.expected_duration_s, 6);
+
+    Serial.print("reverse_direction = ");
+    Serial.println(cmd.reverse_direction ? "true" : "false");
+
+    Serial.println("======================================");
+}
+
+#endif
+// ======================================
+
 static bool build_realtime_motion_planner_from_current_settings()
 {
     realtime_motion_planner_valid = false;
+    tmc_executable_planner_valid = false;
+    g_tmc_ramp_cmd = TmcRampCommand();
+
     realtime_curve_volume_max_uL = 1000.0f;
     realtime_curve_current_max_A = 3.0f;
 
@@ -1603,7 +1757,6 @@ static bool build_realtime_motion_planner_from_current_settings()
     flow_params.shaft = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_SHAFT);
     flow_params.shaft_walls = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_SHAFT_WALL);
     flow_params.E = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_E);
-    flow_params.S = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_S);
     flow_params.r = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_r);
     flow_params.l = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_l);
     flow_params.lead_pitch = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_LEAD_PITCH);
@@ -1612,16 +1765,36 @@ static bool build_realtime_motion_planner_from_current_settings()
     flow_params.max_linear_speed_mm_s = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_MAX_LINEAR_SPEED_MM_S);
     flow_params.I_plunger = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_I_PLUNGER);
 
-    // fixed values for now
-    flow_params.eta = 0.30f;
-    flow_params.Kt = 0.45f;
-    flow_params.max_rpm = 300.0f;
-    flow_params.steps_per_rev = 3200.0f;
-    flow_params.max_step_freq = 50000.0f;
-    flow_params.beta = 0.30f;
-    flow_params.K_buckling = 0.5f;
+    // First-order acceleration upper-bound model.
+    // This does NOT explain the current idle no-motion issue.
+    // The idle no-motion issue is still treated as a TMC low-acceleration execution problem.
+    flow_params.moving_mass_kg = 0.5f;
+    flow_params.friction_force_N = 0.0f;
+    flow_params.acceleration_utilization = 1.0f;
+
+    // false:
+    // F_pressure and F_friction are calculated for debug/reference,
+    // but they are not subtracted from F_capacity.
+    flow_params.use_load_terms_for_accel = false;
+
+    // Engineering constants such as eta, Kt, max_rpm, steps_per_rev,
+    // max_step_freq, beta, S, and K_buckling are kept in
+    // FlowConstraintModel::Params() defaults.
+    // They are intentionally not exposed to normal syringe users.
+
+    // ====== For Planner Value Monitor =====
+    #if DEBUG_PLANNER
+    print_flow_params(flow_params);
+    #endif
+    // ======================================
 
     FlowConstraintModel::Result flow_result = FlowConstraintModel::compute(flow_params);
+    // ====== For Planner Value Monitor =====
+    #if DEBUG_PLANNER
+    print_flow_result(flow_result);
+    #endif
+    // ======================================
+
     if (!flow_result.valid || flow_result.Q_allow <= 0.0f) {
         return false;
     }
@@ -1637,7 +1810,152 @@ static bool build_realtime_motion_planner_from_current_settings()
 
     realtime_motion_planner_valid = true;
 
-    realtime_curve_volume_max_uL = motion_cmd.volume;
+    // ====== For Planner Value Monitor =====
+    #if DEBUG_PLANNER
+    print_ideal_planner(realtime_motion_planner);
+    #endif
+    // ======================================
+
+    // // ------------------------------------------------------------
+    // // TMC executable ramp configuration
+    // // ------------------------------------------------------------
+    // // This configuration defines the executable lower and upper bounds
+    // // used when converting the ideal fluid-safe motion curve into a
+    // // TMC5160 internal-ramp command.
+    // //
+    // // Important:
+    // // These values are not viscosity classification thresholds.
+    // // They are not used to switch control paths.
+    // //
+    // // The purpose of this block is to ensure that the generated TMC ramp:
+    // // 1. does not exceed the physical flow / force constraints calculated
+    // //    by FlowConstraintModel
+    // // 2. does not fall below the experimentally verified executable ramp
+    // //    range of the TMC5160 internal ramp generator
+    // //
+    // // Current verified baseline from manual Motor Control test:
+    // // MaxVel   = 0.30 mm/s
+    // // MaxAcc   = 0.20 mm/s^2
+    // // MaxDec   = 0.20 mm/s^2
+    // // FirstVel = 0.00 mm/s
+    // // FirstAcc = 0.10 mm/s^2
+    // // FirstDec = 0.10 mm/s^2
+    // //
+    // // Note:
+    // // Acceleration values lower than this baseline may generate a valid
+    // // software command but may not produce reliable physical motor motion,
+    // // especially after conversion into TMC internal register values.
+    // //
+    // // Future work:
+    // // Move these verified ramp bounds into CustomizedParametersScreen
+    // // or a dedicated hardware calibration profile.
+
+    TmcExecutableRampPlanner::Config tmc_cfg;
+
+    // Required for very low speed such as 0.007 mm/s
+    tmc_cfg.min_velocity_mm_s = 0.001f;
+
+    // Do not set acceleration too low.
+    // At your current effective resolution, 0.005 to 0.01 mm/s² is safer.
+    tmc_cfg.min_acceleration_mm_s2 = 0.005f;
+    tmc_cfg.min_deceleration_mm_s2 = 0.005;
+
+    // Keep upper bound moderate.
+    tmc_cfg.max_acceleration_mm_s2 = 0.10f;
+    tmc_cfg.max_deceleration_mm_s2 = 0.10f;
+
+    tmc_cfg.start_velocity_mm_s = 0.0f;
+
+    // Position mode should not use VSTOP = 0.
+    // Must be smaller than 0.007 mm/s.
+    tmc_cfg.stop_velocity_mm_s = 0.001f;
+
+    // Keep first velocity zero if this was already verified.
+    tmc_cfg.first_velocity_ratio = 0.0f;
+
+    // But keep first acceleration/deceleration nonzero.
+    tmc_cfg.first_acceleration_ratio = 0.50f;
+    tmc_cfg.first_deceleration_ratio = 0.50f;
+
+    tmc_cfg.velocity_safety_scale = 1.0f;
+    tmc_cfg.reverse_direction = false;
+
+    if (!tmc_executable_planner.build(
+            realtime_motion_planner,
+            flow_params,
+            flow_result,
+            tmc_cfg
+        )) {
+        realtime_motion_planner_valid = false;
+        tmc_executable_planner_valid = false;
+        g_tmc_ramp_cmd = TmcRampCommand();
+        return false;
+    }
+
+    g_tmc_ramp_cmd = tmc_executable_planner.command();
+    tmc_executable_planner_valid = g_tmc_ramp_cmd.valid;
+
+    // ====== For Planner Value Monitor =====
+    #if DEBUG_PLANNER
+    print_tmc_command(g_tmc_ramp_cmd);
+    #endif
+    // ======================================
+
+    // //////////
+    // Serial.println("========== SETTING GENERATED TMC CMD ==========");
+
+    // Serial.print("quantity_uL = ");
+    // Serial.println(g_tmc_ramp_cmd.quantity_uL, 6);
+
+    // Serial.print("stroke_per_ml_mm = ");
+    // Serial.println(g_tmc_ramp_cmd.stroke_per_ml_mm, 6);
+
+    // Serial.print("target_distance_mm = ");
+    // Serial.println(g_tmc_ramp_cmd.target_distance_mm, 6);
+
+    // Serial.print("max_velocity_mm_s = ");
+    // Serial.println(g_tmc_ramp_cmd.max_velocity_mm_s, 6);
+
+    // Serial.print("max_acceleration_mm_s2 = ");
+    // Serial.println(g_tmc_ramp_cmd.max_acceleration_mm_s2, 6);
+
+    // Serial.print("max_deceleration_mm_s2 = ");
+    // Serial.println(g_tmc_ramp_cmd.max_deceleration_mm_s2, 6);
+
+    // Serial.print("start_velocity_mm_s = ");
+    // Serial.println(g_tmc_ramp_cmd.start_velocity_mm_s, 6);
+
+    // Serial.print("stop_velocity_mm_s = ");
+    // Serial.println(g_tmc_ramp_cmd.stop_velocity_mm_s, 6);
+
+    // Serial.print("first_velocity_mm_s = ");
+    // Serial.println(g_tmc_ramp_cmd.first_velocity_mm_s, 6);
+
+    // Serial.print("first_acceleration_mm_s2 = ");
+    // Serial.println(g_tmc_ramp_cmd.first_acceleration_mm_s2, 6);
+
+    // Serial.print("first_deceleration_mm_s2 = ");
+    // Serial.println(g_tmc_ramp_cmd.first_deceleration_mm_s2, 6);
+
+    // Serial.print("expected_duration_s = ");
+    // Serial.println(g_tmc_ramp_cmd.expected_duration_s, 6);
+
+    // Serial.print("reverse_direction = ");
+    // Serial.println(g_tmc_ramp_cmd.reverse_direction ? "true" : "false");
+
+    // Serial.print("valid = ");
+    // Serial.println(g_tmc_ramp_cmd.valid ? "true" : "false");
+
+    // Serial.println("================================================");
+    // //////////
+
+    if (!tmc_executable_planner_valid) {
+        realtime_motion_planner_valid = false;
+        return false;
+    }
+
+    realtime_curve_volume_max_uL = g_tmc_ramp_cmd.quantity_uL;
+
     if (realtime_curve_volume_max_uL < 1.0f) {
         realtime_curve_volume_max_uL = 1.0f;
     }
@@ -1657,76 +1975,15 @@ static bool build_realtime_motion_planner_from_current_settings()
         peak_current_A = 0.1f;
     }
 
-    realtime_curve_current_max_A = peak_current_A;
+    realtime_curve_current_max_A = peak_current_A * 1.1f;
 
-    return true;
-}
-
-static bool build_realtime_spi_streamer_from_current_settings()
-{
-    realtime_streamer_valid = false;
-
-    HardwareConfig hw_cfg;
-    KinematicsConfig kin_cfg;
-    DriverConfig drv_cfg;
-    TrackingConfig track_cfg;
-    InaConfig ina_cfg;
-
-    // ===== 硬體設定 =====
-    hw_cfg.pin_oe = 4;
-    hw_cfg.enable_hardware_pin = 7;
-    hw_cfg.chip_select_pin = 10;
-    hw_cfg.ina228_addr = 0x40;
-    hw_cfg.use_spi1 = true;
-    hw_cfg.spi_clock_hz = 5000000;
-    hw_cfg.use_wire1_for_ina = true;
-
-    // ===== 運動學 / 校正 =====
-    kin_cfg.microsteps_per_mm = 3507.0f;       // ← 這裡填你目前校正值
-    kin_cfg.planner_meter_to_real_unit = 1000.0f; // planner輸出m，driver吃mm
-
-    // ===== Driver參數 =====
-    drv_cfg.run_current_percent = 80;
-    drv_cfg.pwm_offset_percent = 40;
-    drv_cfg.pwm_gradient_percent = 15;
-    drv_cfg.reverse_direction = false;
-    drv_cfg.stealth_chop_threshold = 50;
-
-    const float vmax_mm_s = CustomizedParametersScreen::getSavedFloat(CustomizedParametersScreen::DEV_P_MAX_LINEAR_SPEED_MM_S);
-
-    // ===== Tracking參數 =====
-    // 這組不是擠出7-segment本身，而是讓TMC追得上streaming target
-    track_cfg.max_velocity = vmax_mm_s;
-    track_cfg.max_acceleration = 5.0f;
-    track_cfg.start_velocity = 0.5f;
-    track_cfg.stop_velocity = 0.5f;
-    track_cfg.first_velocity = 1.0f;
-    track_cfg.first_acceleration = 2.0f;
-    track_cfg.max_deceleration = 1.0f;
-    track_cfg.first_deceleration = 2.0f;
-    track_cfg.stream_period_ms = 10;
-    track_cfg.force_final_target = true;
-
-    // ===== INA228 =====
-    ina_cfg.shunt_ohms = 0.02f;
-    ina_cfg.max_current_a = 5.0f;
-    ina_cfg.averaging = INA228_COUNT_16;
-    ina_cfg.voltage_conv = INA228_TIME_150_us;
-    ina_cfg.current_conv = INA228_TIME_280_us;
-
-    if (!realtime_streamer.begin(hw_cfg, kin_cfg, drv_cfg, track_cfg, ina_cfg)) {
-        return false;
-    }
-
-    if (!realtime_streamer.attachPlanner(&realtime_motion_planner)) {
-        return false;
-    }
-
-    realtime_streamer_valid = true;
     return true;
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(500);
+
   Display.begin();
   TouchDetector.begin();
   MotionModeManager::begin();
@@ -1827,33 +2084,44 @@ void loop()
     // =============================
     if (stop_requested)
     {
-        bool stopped =
-            MotorControlScreen::motionFinished();
+        bool stopped = MotorControlScreen::motionFinished();
 
-        bool stop_timeout =
+        bool stop_wait_timeout =
             (millis() - stop_request_ms > 3000);
 
-        if (stopped || stop_timeout)
+        if (stopped || stop_wait_timeout)
         {
+            const bool was_timeout_stop = stop_requested_by_timeout;
+
             stop_requested = false;
+            stop_requested_by_timeout = false;
             is_running = false;
 
-            MotionModeManager::forceIdle(
-                stop_timeout ? "Stop timeout" : "User stopped"
-            );
+            const char* stop_reason = "Stopped";
 
-            low_viscosity_mode_active = false;
-            low_viscosity_timeout = false;
+            if (was_timeout_stop) {
+                stop_reason = stop_wait_timeout
+                    ? "Timeout stop failed"
+                    : "Extrusion timeout stopped";
+            }
+            else {
+                stop_reason = stop_wait_timeout
+                    ? "Stop timeout"
+                    : "User stopped";
+            }
+
+            MotionModeManager::forceIdle(stop_reason);
+
             recorded_duration_valid = false;
+            realtime_motion_planner_valid = false;
+            tmc_executable_planner_valid = false;
+            g_tmc_ramp_cmd = TmcRampCommand();
 
             set_tab3_control_buttons_enabled(true);
 
             if (RealtimeCurveRenderer::isInitialized()) {
                 RealtimeCurveRenderer::releaseTempData();
             }
-
-            realtime_motion_planner_valid = false;
-            realtime_streamer_valid = false;
 
             if (start_btn)
             {
@@ -1879,63 +2147,65 @@ void loop()
     // Normal runtime logic
     // =============================
     if (is_running) {
-        bool finished_by_streamer = false;
+        float elapsed_s = (millis() - run_start_ms) / 1000.0f;
 
-        if (realtime_streamer_valid) {
-            finished_by_streamer = realtime_streamer.isFinished();
-        }
+        bool finished_by_motor =
+            MotorControlScreen::motionFinished();
 
-        unsigned long elapsed_sec = (millis() - run_start_ms) / 1000;
-        bool finished_by_time = false;
+        bool timeout =
+            recorded_duration_valid &&
+            elapsed_s > (recorded_duration_sec_exact + 5.0f);
 
-        if (low_viscosity_mode_active)
-        {
-            finished_by_time = MotorControlScreen::motionFinished();
+        // Timeout must enter controlled stop.
+        // Do not cleanup immediately, because the TMC ramp may still be decelerating.
+        if (timeout) {
+            auto tr = MotionModeManager::requestScenario(
+                MotionModeManager::SCENARIO_EXTRUSION_STOPPING
+            );
 
-            if (!finished_by_time && elapsed_sec > recorded_duration_sec + 5)
-            {
-                low_viscosity_timeout = true;
-                MotorControlScreen::stopMotion();
-                finished_by_time = true;
+            if (!tr.success) {
+                MotionModeManager::forceIdle("Extrusion timeout");
             }
-        }
-        else {
-            finished_by_time = (!realtime_streamer_valid && elapsed_sec >= recorded_duration_sec);
+
+            MotorControlScreen::stopMotion();
+
+            stop_requested = true;
+            stop_requested_by_timeout = true;
+            stop_request_ms = millis();
+
+            MotorControlScreen::update();
+            delay(5);
+            return;
         }
 
-        if (finished_by_streamer || finished_by_time) {
-            if (realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
+        if (finished_by_motor) {
+            if (tmc_executable_planner_valid &&
+                RealtimeCurveRenderer::isInitialized()) {
+
                 float T = recorded_duration_sec_exact;
-                PlungerMotionPlanner::Sample sT = realtime_motion_planner.evaluate(T);
-
-                float real_current_A = 0.0f;
-                if (realtime_streamer_valid) {
-                    real_current_A = realtime_streamer.getStatus().measured_current_mA / 1000.0f;
-                }
+                TmcExecutableRampPlanner::Sample sT =
+                    tmc_executable_planner.evaluate(T);
 
                 RealtimeCurveRenderer::pushSample(
                     T,
-                    sT.volume,
-                    real_current_A
+                    sT.volume_uL,
+                    MotorControlScreen::getMeasuredCurrentA()
                 );
             }
 
             is_running = false;
             set_tab3_control_buttons_enabled(true);
-            MotionModeManager::finishCurrentScenario();
-            low_viscosity_mode_active = false;
-            recorded_duration_valid = false;
 
-            if (realtime_streamer_valid && realtime_streamer.isRunning()) {
-                realtime_streamer.stop(true);
-            }
+            MotionModeManager::finishCurrentScenario();
+
+            recorded_duration_valid = false;
+            realtime_motion_planner_valid = false;
+            tmc_executable_planner_valid = false;
+            g_tmc_ramp_cmd = TmcRampCommand();
 
             if (RealtimeCurveRenderer::isInitialized()) {
                 RealtimeCurveRenderer::releaseTempData();
             }
-
-            realtime_motion_planner_valid = false;
-            realtime_streamer_valid = false;
 
             if (start_btn) {
                 lv_obj_t* label = lv_obj_get_child(start_btn, 0);
@@ -2006,15 +2276,10 @@ void loop()
     }
 
     update_system_progress_data();
-
-    if (realtime_streamer_valid) {
-        realtime_streamer.update();
-    }
-
     MotorControlScreen::update();
 
-    // --- realtime theoretical curve update ---
-    if (is_running && realtime_motion_planner_valid && RealtimeCurveRenderer::isInitialized()) {
+    // --- realtime curve update ---
+    if (is_running && RealtimeCurveRenderer::isInitialized()) {
         if (millis() - last_curve_update_ms >= 50) {
             last_curve_update_ms = millis();
 
@@ -2027,21 +2292,20 @@ void loop()
             if (t_s > recorded_duration_sec_exact) {
                 t_s = recorded_duration_sec_exact;
             }
+            //
+            if (tmc_executable_planner_valid) {
+                TmcExecutableRampPlanner::Sample sample =
+                    tmc_executable_planner.evaluate(t_s);
 
-            float q_uL = recorded_quantity ? atof(recorded_quantity) : 0.0f;
-            float ratio = t_s / recorded_duration_sec_exact;
+                float current_A =
+                    MotorControlScreen::getMeasuredCurrentA();
 
-            if (ratio < 0.0f) ratio = 0.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-
-            float volume_uL = q_uL * ratio;
-            float current_A = MotorControlScreen::getMeasuredCurrentA();
-
-            RealtimeCurveRenderer::pushSample(
-                t_s,
-                volume_uL,
-                current_A
-            );
+                RealtimeCurveRenderer::pushSample(
+                    t_s,
+                    sample.volume_uL,
+                    current_A
+                );
+            }
         }
     }
 

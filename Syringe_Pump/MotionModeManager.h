@@ -5,19 +5,20 @@
 
 namespace MotionModeManager {
 
-// =========================
-// High-level motion mode
-// =========================
 enum MotionMode {
     MODE_IDLE = 0,
 
-    // Precision-critical motion:
-    // external planner + SPI streaming
-    MODE_PRECISION_EXTRUSION,
+    // Extrusion motion:
+    // TMC internal ramp generator with fluid-aware ramp parameters
+    MODE_EXTRUSION,
 
-    // Non-critical service motions:
-    // TMC internal ramp generator
-    MODE_SERVICE_MOTION
+    // Service motions:
+    // Homing, manual jog, reposition
+    MODE_SERVICE_MOTION,
+
+    // Fault state:
+    // Current overload, stall, timeout, driver fault, etc.
+    MODE_FAULT
 };
 
 // =========================
@@ -26,7 +27,7 @@ enum MotionMode {
 enum MotionScenario {
     SCENARIO_NONE = 0,
 
-    // precision
+    // extrusion
     SCENARIO_EXTRUSION_ACTIVE,
     SCENARIO_EXTRUSION_STOPPING,
 
@@ -34,7 +35,9 @@ enum MotionScenario {
     SCENARIO_HOMING,
     SCENARIO_MANUAL_JOG,
     SCENARIO_REPOSITION,
-    SCENARIO_LOW_VISCOSITY_EXTRUSION
+
+    // fault
+    SCENARIO_FAULT
 };
 
 // =========================
@@ -42,7 +45,6 @@ enum MotionScenario {
 // =========================
 enum MotionBackend {
     BACKEND_NONE = 0,
-    BACKEND_EXTERNAL_SPI_STREAMING,
     BACKEND_TMC_INTERNAL_RAMP
 };
 
@@ -86,10 +88,12 @@ MotionBackend getBackend();
 bool isBusy();
 bool isIdle();
 
-bool isPrecisionMode();
+bool isExtrusionMode();
+bool isPrecisionMode();   // legacy alias for extrusion mode
 bool isServiceMode();
+bool isFaultMode();
 
-bool usesExternalStreaming();
+bool usesExternalStreaming(); // legacy compatibility, always false
 bool usesInternalRamp();
 
 // =========================

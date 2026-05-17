@@ -39,7 +39,7 @@ void apply_state(MotionScenario scenario) {
     g_state.busy = (scenario != SCENARIO_NONE);
 }
 
-bool is_precision_scenario_internal(MotionScenario scenario)
+bool is_extrusion_scenario_internal(MotionScenario scenario)
 {
     switch (scenario)
     {
@@ -59,12 +59,16 @@ bool is_service_scenario_internal(MotionScenario scenario)
         case SCENARIO_HOMING:
         case SCENARIO_MANUAL_JOG:
         case SCENARIO_REPOSITION:
-        case SCENARIO_LOW_VISCOSITY_EXTRUSION:
             return true;
 
         default:
             return false;
     }
+}
+
+bool is_fault_scenario_internal(MotionScenario scenario)
+{
+    return scenario == SCENARIO_FAULT;
 }
 
 } // anonymous namespace
@@ -111,16 +115,29 @@ bool isIdle() {
     return g_state.mode == MODE_IDLE;
 }
 
-bool isPrecisionMode() {
-    return g_state.mode == MODE_PRECISION_EXTRUSION;
+bool isExtrusionMode()
+{
+    return g_state.mode == MODE_EXTRUSION;
 }
 
-bool isServiceMode() {
+bool isPrecisionMode()
+{
+    return isExtrusionMode();
+}
+
+bool isServiceMode()
+{
     return g_state.mode == MODE_SERVICE_MOTION;
 }
 
-bool usesExternalStreaming() {
-    return g_state.backend == BACKEND_EXTERNAL_SPI_STREAMING;
+bool isFaultMode()
+{
+    return g_state.mode == MODE_FAULT;
+}
+
+bool usesExternalStreaming()
+{
+    return false;
 }
 
 bool usesInternalRamp() {
@@ -130,21 +147,27 @@ bool usesInternalRamp() {
 // =========================
 // Scenario mapping
 // =========================
-MotionMode modeForScenario(MotionScenario scenario) {
-    if (is_precision_scenario_internal(scenario)) {
-        return MODE_PRECISION_EXTRUSION;
+MotionMode modeForScenario(MotionScenario scenario)
+{
+    if (is_extrusion_scenario_internal(scenario)) {
+        return MODE_EXTRUSION;
     }
 
     if (is_service_scenario_internal(scenario)) {
         return MODE_SERVICE_MOTION;
     }
 
+    if (is_fault_scenario_internal(scenario)) {
+        return MODE_FAULT;
+    }
+
     return MODE_IDLE;
 }
 
-MotionBackend backendForScenario(MotionScenario scenario) {
-    if (is_precision_scenario_internal(scenario)) {
-        return BACKEND_EXTERNAL_SPI_STREAMING;
+MotionBackend backendForScenario(MotionScenario scenario)
+{
+    if (is_extrusion_scenario_internal(scenario)) {
+        return BACKEND_TMC_INTERNAL_RAMP;
     }
 
     if (is_service_scenario_internal(scenario)) {
@@ -154,16 +177,26 @@ MotionBackend backendForScenario(MotionScenario scenario) {
     return BACKEND_NONE;
 }
 
-bool isPrecisionCriticalScenario(MotionScenario scenario) {
-    return is_precision_scenario_internal(scenario);
+bool isPrecisionCriticalScenario(MotionScenario scenario)
+{
+    return is_extrusion_scenario_internal(scenario);
 }
 
 // =========================
 // Permission checks
 // =========================
-bool canStartScenario(MotionScenario scenario) {
+bool canStartScenario(MotionScenario scenario)
+{
     if (scenario == SCENARIO_NONE) {
         return true;
+    }
+
+    if (scenario == SCENARIO_FAULT) {
+        return true;
+    }
+
+    if (scenario == SCENARIO_EXTRUSION_STOPPING) {
+        return g_state.scenario == SCENARIO_EXTRUSION_ACTIVE;
     }
 
     if (!g_state.busy) {
@@ -173,17 +206,24 @@ bool canStartScenario(MotionScenario scenario) {
     return false;
 }
 
-bool canInterruptWith(MotionScenario scenario) {
+bool canInterruptWith(MotionScenario scenario)
+{
     if (!g_state.busy) {
         return true;
     }
 
-    // During precision extrusion, do not allow service actions to interrupt.
-    if (g_state.mode == MODE_PRECISION_EXTRUSION) {
-        switch (scenario) {
-            case SCENARIO_NONE:
-                return true;
+    if (scenario == SCENARIO_FAULT) {
+        return true;
+    }
 
+    if (scenario == SCENARIO_NONE) {
+        return true;
+    }
+
+    // During extrusion, only controlled stopping is allowed.
+    if (g_state.mode == MODE_EXTRUSION) {
+        switch (scenario)
+        {
             case SCENARIO_EXTRUSION_STOPPING:
                 return true;
 
@@ -192,10 +232,10 @@ bool canInterruptWith(MotionScenario scenario) {
         }
     }
 
-    // During service motion, allow forceful transitions only to idle or homing-like flows
+    // During service motion, allow fault, idle, or homing transition.
     if (g_state.mode == MODE_SERVICE_MOTION) {
-        switch (scenario) {
-            case SCENARIO_NONE:
+        switch (scenario)
+        {
             case SCENARIO_HOMING:
                 return true;
 
@@ -210,7 +250,8 @@ bool canInterruptWith(MotionScenario scenario) {
 // =========================
 // Transition control
 // =========================
-TransitionResult requestScenario(MotionScenario scenario) {
+TransitionResult requestScenario(MotionScenario scenario)
+{
     if (scenario == SCENARIO_NONE) {
         reset();
         return make_result(
@@ -219,6 +260,16 @@ TransitionResult requestScenario(MotionScenario scenario) {
             g_state.scenario,
             g_state.backend,
             "Returned to idle"
+        );
+    }
+
+    if (!canStartScenario(scenario) && !canInterruptWith(scenario)) {
+        return make_result(
+            false,
+            g_state.mode,
+            g_state.scenario,
+            g_state.backend,
+            "Transition denied"
         );
     }
 
@@ -259,16 +310,22 @@ TransitionResult requestMode(MotionMode mode)
     {
         case MODE_IDLE:
             reset();
-            return make_result(true, g_state.mode, g_state.scenario, g_state.backend, "Mode set to idle");
-
-        case MODE_PRECISION_EXTRUSION:
-            return requestScenario(SCENARIO_EXTRUSION_ACTIVE);
-
-        case MODE_SERVICE_MOTION:
-            return requestScenario(SCENARIO_HOMING);
+            return make_result(
+                true,
+                g_state.mode,
+                g_state.scenario,
+                g_state.backend,
+                "Mode set to idle"
+            );
 
         default:
-            return make_result(false, g_state.mode, g_state.scenario, g_state.backend, "Unknown mode");
+            return make_result(
+                false,
+                g_state.mode,
+                g_state.scenario,
+                g_state.backend,
+                "Direct mode request denied: request a specific scenario"
+            );
     }
 }
 
@@ -294,17 +351,38 @@ TransitionResult forceIdle(const char* reason) {
     );
 }
 
+TransitionResult enterFault(const char* reason)
+{
+    apply_state(SCENARIO_FAULT);
+
+    return make_result(
+        true,
+        g_state.mode,
+        g_state.scenario,
+        g_state.backend,
+        reason ? reason : "Fault"
+    );
+}
+
 // =========================
 // String helpers
 // =========================
-const char* modeToString(MotionMode mode) {
-    switch (mode) {
+const char* modeToString(MotionMode mode)
+{
+    switch (mode)
+    {
         case MODE_IDLE:
             return "IDLE";
-        case MODE_PRECISION_EXTRUSION:
-            return "PRECISION_EXTRUSION";
+
+        case MODE_EXTRUSION:
+            return "EXTRUSION";
+
         case MODE_SERVICE_MOTION:
             return "SERVICE_MOTION";
+
+        case MODE_FAULT:
+            return "FAULT";
+
         default:
             return "UNKNOWN_MODE";
     }
@@ -326,8 +404,8 @@ const char* scenarioToString(MotionScenario scenario)
         case SCENARIO_REPOSITION:
             return "REPOSITION";
 
-        case SCENARIO_LOW_VISCOSITY_EXTRUSION:
-            return "LOW_VISCOSITY_EXTRUSION";
+        case SCENARIO_FAULT:
+            return "FAULT";
 
         case SCENARIO_EXTRUSION_ACTIVE:
             return "EXTRUSION_ACTIVE";
@@ -340,14 +418,16 @@ const char* scenarioToString(MotionScenario scenario)
     }
 }
 
-const char* backendToString(MotionBackend backend) {
-    switch (backend) {
+const char* backendToString(MotionBackend backend)
+{
+    switch (backend)
+    {
         case BACKEND_NONE:
             return "NONE";
-        case BACKEND_EXTERNAL_SPI_STREAMING:
-            return "EXTERNAL_SPI_STREAMING";
+
         case BACKEND_TMC_INTERNAL_RAMP:
             return "TMC_INTERNAL_RAMP";
+
         default:
             return "UNKNOWN_BACKEND";
     }

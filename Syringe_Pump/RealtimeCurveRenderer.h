@@ -9,9 +9,9 @@ public:
     struct Config {
         uint16_t point_count;        // optional direct override, 0 means auto-calc
         float expected_duration_s;   // expected total duration for axis scaling
-        float volume_max_uL;         // y-axis upper hint for volume chart
-        float current_max_A;         // y-axis upper hint for current chart
-        uint32_t sample_interval_ms; // plot one point every N ms when auto-calculating point_count
+        float volume_max_uL;         // y-axis upper bound for executable volume chart [uL]
+        float current_max_A;         // y-axis upper bound for measured current chart [A]
+        uint32_t sample_interval_ms; // desired plot interval [ms] when point_count is auto-calculated
 
         Config()
         : point_count(0),
@@ -33,9 +33,9 @@ public:
     );
 
     static void pushSample(
-        float t_s,        // time since start (s)
-        float volume_uL,  // theoretical dispensed volume (uL)
-        float current_A   // theoretical current (A)
+        float t_s,        // time since start [s]
+        float volume_uL,  // planned executable dispensed volume [uL]
+        float current_A   // measured current from INA228 [A]
     );
 
     static bool isInitialized();

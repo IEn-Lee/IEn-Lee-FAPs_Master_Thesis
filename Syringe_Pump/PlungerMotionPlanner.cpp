@@ -5,7 +5,7 @@
 // =========================
 float PlungerMotionPlanner::safe_positive(float x)
 {
-    return (x > 0.0f) ? x : 0.0f;
+    return (isfinite(x) && x > 0.0f) ? x : 0.0f;
 }
 
 // =========================
@@ -39,11 +39,14 @@ float PlungerMotionPlanner::pressure_from_flow(
 )
 {
     if (mu <= 0.0f || l <= 0.0f || r <= 0.0f) return 0.0f;
+
     const float r4 = r * r * r * r;
     if (r4 <= 0.0f) return 0.0f;
 
+    const float Q_abs = fabsf(Q);
+
     // ΔP = (8 μ l Q) / (π r^4)
-    return (8.0f * mu * l * Q) / (PI * r4);
+    return (8.0f * mu * l * Q_abs) / (PI * r4);
 }
 
 float PlungerMotionPlanner::estimate_current_from_flow(float Q) const
@@ -59,25 +62,72 @@ float PlungerMotionPlanner::estimate_current_from_flow(float Q) const
     // F = (Kp * Q) * A
     // tau = F * lead_pitch / (2*pi*eta)
     // I = tau / Kt
-    return ((Kp * Q * m_A) * m_params.lead_pitch) /
-           (2.0f * PI * m_params.eta * m_params.Kt);
+    const float Q_abs = fabsf(Q);
+
+    return ((Kp * Q_abs * m_A) * m_params.lead_pitch) /
+        (2.0f * PI * m_params.eta * m_params.Kt);
 }
 
 void PlungerMotionPlanner::fill_derived_outputs(Sample& s) const
 {
-    // x [m] -> dispensed volume [m^3]
-    const float volume_m3 = s.plungerPos * m_A;
+    if (m_stroke_per_ml_mm <= 0.0f) {
+        s.volume       = 0.0f;
+        s.flow         = 0.0f;
+        s.flow_uL_s    = 0.0f;
+        s.pressure     = 0.0f;
+        s.pressure_bar = 0.0f;
+        s.force        = 0.0f;
+        s.currentEst   = 0.0f;
+        return;
+    }
 
-    // v [m/s] -> Q [m^3/s]
-    const float Q = s.plungerVel * m_A;
+    // ------------------------------------------------------------
+    // Unified syringe calibration mapping
+    // ------------------------------------------------------------
+    // Position:
+    //   x [m] -> x_mm [mm]
+    //   volume_mL = x_mm / stroke_per_ml_mm
+    //
+    // Velocity:
+    //   v [m/s] -> v_mm_s [mm/s]
+    //   flow_mL_s = v_mm_s / stroke_per_ml_mm
+    //   Q [m^3/s] = flow_mL_s * 1e-6
+    // ------------------------------------------------------------
+    const float x_mm =
+        s.plungerPos * 1000.0f;
+
+    const float v_mm_s =
+        s.plungerVel * 1000.0f;
+
+    float volume_uL =
+        (x_mm / m_stroke_per_ml_mm) * 1000.0f;
+
+    const float flow_mL_s =
+        v_mm_s / m_stroke_per_ml_mm;
+
+    const float Q =
+        flow_mL_s * 1.0e-6f; // m^3/s
+
+    if (volume_uL < 0.0f) {
+        volume_uL = 0.0f;
+    }
+
+    const float target_uL =
+        m_targetVolume * 1.0e9f;
+
+    if (volume_uL > target_uL) {
+        volume_uL = target_uL;
+    }
 
     const float dP = pressure_from_flow(m_mu, m_params.l, m_params.r, Q);
+
+    // R is still used here only for hydraulic force conversion.
     const float F  = dP * m_A;
     const float I  = estimate_current_from_flow(Q);
 
-    s.volume       = volume_m3 * 1.0e9f;  // uL
+    s.volume       = volume_uL;
     s.flow         = Q;
-    s.flow_uL_s    = Q * 1.0e9f;          // uL/s
+    s.flow_uL_s    = Q * 1.0e9f;
     s.pressure     = dP;
     s.pressure_bar = dP / 1.0e5f;
     s.force        = F;
@@ -97,16 +147,18 @@ bool PlungerMotionPlanner::build(
     m_limits = limits;
     m_cmd    = cmd;
 
-    m_A            = FlowConstraintModel::plunger_area_from_R(params.R);                // m^2
-    m_mu           = FlowConstraintModel::viscosity_Pa_s_from_mPa_s(params.viscosity);  // Pa.s
-    m_targetVolume = cmd.volume * 1.0e-9f;                                              // uL -> m^3
-    m_targetStroke = 0.0f;
-    m_v_allow      = 0.0f;
-    m_v_peak       = 0.0f;
-    m_a_max        = 0.0f;
-    m_j_max        = 0.0f;
-    m_T_total      = 0.0f;
-    m_valid        = false;
+    m_A                 = FlowConstraintModel::plunger_area_from_R(params.R);                // m^2
+    m_mu                = FlowConstraintModel::viscosity_Pa_s_from_mPa_s(params.viscosity);  // Pa.s
+    m_stroke_per_ml_mm  = params.stroke_per_ml_mm;                                           // mm/mL
+
+    m_targetVolume      = cmd.volume * 1.0e-9f;                                              // uL -> m^3
+    m_targetStroke      = 0.0f;
+    m_v_allow           = 0.0f;
+    m_v_peak            = 0.0f;
+    m_a_max             = 0.0f;
+    m_j_max             = 0.0f;
+    m_T_total           = 0.0f;
+    m_valid             = false;
 
     for (int i = 0; i < 7; i++) {
         m_durations[i] = 0.0f;
@@ -120,17 +172,58 @@ bool PlungerMotionPlanner::build(
 
     // Basic checks
     if (!limits.valid) return false;
-    if (m_A <= 0.0f) return false;
-    if (m_targetVolume <= 0.0f) return false;
-    if (!(cmd.ramp_ratio > 0.0f && cmd.ramp_ratio < (1.0f / 3.0f))) return false;
-    if (cmd.min_ramp_time <= 0.0f) return false;
-    if (limits.Q_allow <= 0.0f) return false;
+    if (!isfinite(m_A) || m_A <= 0.0f) return false;
+    if (!isfinite(m_stroke_per_ml_mm) || m_stroke_per_ml_mm <= 0.0f) return false;
+    if (!isfinite(m_targetVolume) || m_targetVolume <= 0.0f) return false;
 
-    // Domain mapping
-    m_targetStroke = m_targetVolume / m_A; // m
-    m_v_allow      = limits.Q_allow / m_A; // m/s
+    if (!isfinite(cmd.ramp_ratio) ||
+        !(cmd.ramp_ratio > 0.0f && cmd.ramp_ratio < (1.0f / 3.0f))) {
+        return false;
+    }
 
-    if (m_targetStroke <= 0.0f || m_v_allow <= 0.0f) return false;
+    if (!isfinite(cmd.min_ramp_time) || cmd.min_ramp_time <= 0.0f) {
+        return false;
+    }
+
+    if (!isfinite(limits.Q_allow) || limits.Q_allow <= 0.0f) {
+        return false;
+    }
+
+    // ------------------------------------------------------------
+    // Domain mapping using syringe calibration
+    // ------------------------------------------------------------
+    // Target stroke:
+    //   cmd.volume [uL] / 1000 = volume [mL]
+    //   stroke [mm] = volume [mL] * stroke_per_ml_mm
+    //
+    // Allowed velocity:
+    //   Q_allow [m^3/s] * 1e6 = flow [mL/s]
+    //   velocity [mm/s] = flow [mL/s] * stroke_per_ml_mm
+    // ------------------------------------------------------------
+    const float target_volume_mL =
+        cmd.volume / 1000.0f;
+
+    const float target_stroke_mm =
+        target_volume_mL * m_stroke_per_ml_mm;
+
+    m_targetStroke =
+        target_stroke_mm * 1.0e-3f; // mm -> m
+
+    const float v_from_flow_mm_s =
+        limits.Q_allow * 1.0e6f * m_stroke_per_ml_mm;
+
+    const float v_from_flow =
+        v_from_flow_mm_s * 1.0e-3f; // mm/s -> m/s
+
+    const float v_from_user =
+        (params.max_linear_speed_mm_s > 0.0f)
+        ? params.max_linear_speed_mm_s * 1.0e-3f
+        : v_from_flow;
+
+    m_v_allow = fminf(v_from_flow, v_from_user);
+
+    if (!isfinite(m_targetStroke) || m_targetStroke <= 0.0f) return false;
+    if (!isfinite(m_v_allow) || m_v_allow <= 0.0f) return false;
 
     // Initial guess from pure ramp_ratio design
     const float T_total_guess = m_targetStroke / (m_v_allow * (1.0f - 3.0f * cmd.ramp_ratio));
@@ -203,6 +296,26 @@ bool PlungerMotionPlanner::build(
         x0 = x1;
         v0 = v1;
         a0 = a1;
+    }
+
+    if (!isfinite(m_T_total) || m_T_total <= 0.0f) {
+        return false;
+    }
+
+    if (!isfinite(m_v_peak) || m_v_peak <= 0.0f) {
+        return false;
+    }
+
+    if (m_v_peak > m_v_allow * 1.001f) {
+        return false;
+    }
+
+    if (!isfinite(m_a_max) || m_a_max <= 0.0f) {
+        return false;
+    }
+
+    if (!isfinite(m_j_max) || m_j_max <= 0.0f) {
+        return false;
     }
 
     m_valid = true;
@@ -321,4 +434,49 @@ float PlungerMotionPlanner::getPeakVelocity_mps() const
 float PlungerMotionPlanner::getArea_m2() const
 {
     return m_A;
+}
+
+float PlungerMotionPlanner::getStrokePerMlMm() const
+{
+    return m_stroke_per_ml_mm;
+}
+
+float PlungerMotionPlanner::getTargetVolume_uL() const
+{
+    return m_targetVolume * 1.0e9f;
+}
+
+float PlungerMotionPlanner::getTargetStroke_mm() const
+{
+    return m_targetStroke * 1.0e3f;
+}
+
+float PlungerMotionPlanner::getAllowedVelocity_mps() const
+{
+    return m_v_allow;
+}
+
+float PlungerMotionPlanner::getAllowedVelocity_mm_s() const
+{
+    return m_v_allow * 1.0e3f;
+}
+
+float PlungerMotionPlanner::getPeakVelocity_mm_s() const
+{
+    return m_v_peak * 1.0e3f;
+}
+
+float PlungerMotionPlanner::getPeakAcceleration_mps2() const
+{
+    return m_a_max;
+}
+
+float PlungerMotionPlanner::getPeakAcceleration_mm_s2() const
+{
+    return m_a_max * 1.0e3f;
+}
+
+float PlungerMotionPlanner::getPeakJerk_mps3() const
+{
+    return m_j_max;
 }
