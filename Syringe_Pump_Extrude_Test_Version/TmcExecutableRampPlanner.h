@@ -104,7 +104,7 @@ public:
           max_deceleration_mm_s2(5.0f),
           start_velocity_mm_s(0.0f),
           stop_velocity_mm_s(0.0f),
-          first_velocity_ratio(0.25f),
+          first_velocity_ratio(0.5f),
           first_acceleration_ratio(0.40f),
           first_deceleration_ratio(0.40f),
           low_viscosity_mPa_s(100.0f),

@@ -422,7 +422,13 @@ void RealtimeCurveRenderer::pushSample(
         s_written_points += newly_written;
     }
     else if (index == s_last_written_index) {
-        // do nothing: avoid overwriting the same point repeatedly
+        // overwrite same time bin with latest measured value
+        // this is important for showing current decay near the end
+        s_volume_series->y_points[index]  = y_volume;
+        s_current_series->y_points[index] = y_current;
+
+        lv_chart_refresh(s_volume_chart);
+        lv_chart_refresh(s_current_chart);
         return;
     }
     else {

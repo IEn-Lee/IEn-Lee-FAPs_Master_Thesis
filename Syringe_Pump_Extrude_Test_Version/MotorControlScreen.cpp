@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <TMC51X0.hpp>
 #include <Adafruit_INA228.h>
+#include <math.h>
 
 #include "lvgl.h"
 #include "fonts.h"
@@ -51,9 +52,42 @@ static constexpr float LEADSCREW_MM_PER_REV = 1.5f;
 // Low-speed preservation:
 // 0.007 mm/s * 35050 = 245.35 controller_units/s,
 // which survives uint32_t truncation as 245 instead of becoming 0.
-static constexpr float MICROSTEPS_PER_REAL_POSITION_UNIT = 1.0f;
+///// ===== How to use ? ===== /////
+// Standard movement(with low viscosity medium) for 13 mm: 523.35f(POSITION_SCALE_FACTOR) * 91.0f(MICROSTEPS_PER_REAL_POSITION_UNIT)
+// Low Boundary of MICROSTEPS_PER_REAL_POSITION_UNIT = 70.0f
+static constexpr float MICROSTEPS_PER_REAL_POSITION_UNIT = 77.36f;
 // Adjustment: new_POSITION_SCALE_FACTOR = old_POSITION_SCALE_FACTOR * target_distance / actual_distance;
-static constexpr float POSITION_SCALE_FACTOR = 35050.0f;
+// POSITION_SCALE_FACTOR = 523.35f for Water & calibration standard (without retraction)
+// POSITION_SCALE_FACTOR = 515.94f for 100 mPa.s
+// Upper Boundary of POSITION_SCALE_FACTOR = 530.0f
+static constexpr float POSITION_SCALE_FACTOR = 530.0f;
+
+// Setting minimum value of speed
+static inline float ceil_to_3_decimals(float value)
+{
+    return ceilf(value * 1000.0f) / 1000.0f;
+}
+
+static inline float min_executable_motion_value()
+{
+    return ceil_to_3_decimals(1.0f / POSITION_SCALE_FACTOR);
+}
+
+static inline float clamp_positive_to_min_executable(float value)
+{
+    if (value <= 0.0f) {
+        return 0.0f;   // intentionally allow exact zero for startVelocity / firstVelocity
+    }
+
+    const float min_value = min_executable_motion_value();
+    return (value < min_value) ? min_value : value;
+}
+
+static inline float clamp_required_to_min_executable(float value)
+{
+    const float min_value = min_executable_motion_value();
+    return (value < min_value) ? min_value : value;
+}
 
 // Allow tolerance between target movement & actual movement
 // 0.01 / 13 = 0.000769 mL = 0.769 µL (±0.077%)
@@ -93,18 +127,21 @@ bool motor_spi_ready  = false;
 bool motor_is_running = false;
 bool motor_stop_ramping = false;
 bool moving_forward_phase = true;
+bool motor_driver_disabled = true;
 
 unsigned long motor_start_ms = 0;
 
 int32_t current_target_chip = 0;
 int32_t current_home_chip   = 0;
 
+
+
 // =========================
 // Settings model
 // =========================
 MotorControlScreen::MotorSpiSettings g_settings = {
-    80.0f,  // runCurrentPercent
-    40.0f,  // pwmOffsetPercent
+    75.0f,  // runCurrentPercent
+    35.0f,  // pwmOffsetPercent
     15.0f,  // pwmGradientPercent
     true,   // reverseDirection
     50.0f,  // stealthChopThreshold
@@ -118,7 +155,7 @@ MotorControlScreen::MotorSpiSettings g_settings = {
     0.1f,   // maxDeceleration
     0.1f,   // firstDeceleration
 
-    MotorControlScreen::MODE_REVOLUTIONS, // mode
+    MotorControlScreen::MODE_DISTANCE_MM, // mode
     1.0f,   // forwardValue
     1.0f    // backwardValue
 };
@@ -153,6 +190,10 @@ lv_obj_t* btn_stop              = NULL;
 lv_obj_t* kb_numeric            = NULL;
 lv_obj_t* kb_target_ta          = NULL;
 
+// textarea focus style
+static lv_style_t st_textarea_focused;
+static bool st_textarea_focused_inited = false;
+
 // =========================
 // Keypad map
 // =========================
@@ -167,6 +208,17 @@ static const char * num_kb_map[] = {
 // =========================
 // Helpers
 // =========================
+void init_textarea_focus_style()
+{
+    if (st_textarea_focused_inited) return;
+    st_textarea_focused_inited = true;
+
+    lv_style_init(&st_textarea_focused);
+    lv_style_set_border_width(&st_textarea_focused, 3);
+    lv_style_set_border_color(&st_textarea_focused, lv_color_hex(0x007ACC));
+    lv_style_set_bg_color(&st_textarea_focused, lv_color_hex(0xF7FBFF));
+}
+
 float ta_to_float(lv_obj_t* ta, float fallback)
 {
     if (!ta) return fallback;
@@ -258,13 +310,21 @@ lv_obj_t* create_title(lv_obj_t* parent, const char* text, lv_coord_t x, lv_coor
 
 lv_obj_t* create_textarea(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, const char* placeholder)
 {
+    init_textarea_focus_style();
+
     lv_obj_t* ta = lv_textarea_create(parent);
     lv_obj_set_size(ta, 180, 55);
     lv_obj_align(ta, LV_ALIGN_TOP_LEFT, x, y);
+
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_placeholder_text(ta, placeholder);
     lv_obj_set_style_text_font(ta, &montserrat_20, 0);
     lv_obj_clear_flag(ta, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Blue border only while this textarea is active/focused.
+    // Do not touch LV_PART_CURSOR, so LVGL default blinking cursor remains unchanged.
+    lv_obj_add_style(ta, &st_textarea_focused, LV_PART_MAIN | LV_STATE_FOCUSED);
+
     return ta;
 }
 
@@ -281,10 +341,32 @@ lv_obj_t* create_dropdown(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, const ch
 // =========================
 // Keyboard
 // =========================
+void clear_active_textarea()
+{
+    if (kb_target_ta) {
+        lv_obj_clear_state(kb_target_ta, LV_STATE_FOCUSED);
+        lv_obj_invalidate(kb_target_ta);
+        kb_target_ta = NULL;
+    }
+}
+
 void keyboard_attach_to(lv_obj_t* ta)
 {
-    if (!kb_numeric) return;
+    if (!kb_numeric || !ta) return;
+
+    // Remove blue border from previous textarea.
+    if (kb_target_ta && kb_target_ta != ta) {
+        lv_obj_clear_state(kb_target_ta, LV_STATE_FOCUSED);
+        lv_obj_invalidate(kb_target_ta);
+    }
+
     kb_target_ta = ta;
+
+    // Add blue border to current textarea.
+    lv_obj_add_state(kb_target_ta, LV_STATE_FOCUSED);
+    lv_textarea_set_cursor_pos(kb_target_ta, LV_TEXTAREA_CURSOR_LAST);
+    lv_obj_invalidate(kb_target_ta);
+
     lv_obj_clear_flag(kb_numeric, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(kb_numeric);
 }
@@ -307,9 +389,9 @@ void keyboard_event_cb(lv_event_t* e)
         return;
     }
 
-    if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0) {
+    if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0 || strcmp(txt, "\n") == 0) {
         lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-        kb_target_ta = NULL;
+        clear_active_textarea();
         return;
     }
 
@@ -347,24 +429,61 @@ void create_keyboard(lv_obj_t* parent)
 // =========================
 void pull_settings_from_ui_internal()
 {
-    g_settings.runCurrentPercent    = ta_to_float(ta_runCurrent, 80.0f);
-    g_settings.pwmOffsetPercent     = ta_to_float(ta_pwmOffset, 40.0f);
+    g_settings.runCurrentPercent    = ta_to_float(ta_runCurrent, 75.0f);
+    g_settings.pwmOffsetPercent     = ta_to_float(ta_pwmOffset, 35.0f);
     g_settings.pwmGradientPercent   = ta_to_float(ta_pwmGradient, 15.0f);
-    g_settings.reverseDirection     = (dd_get_selected(dd_direction) == 1);
+
+    if (dd_direction) {
+        g_settings.reverseDirection = (lv_dropdown_get_selected(dd_direction) == 1);
+    }
+
     g_settings.stealthChopThreshold = ta_to_float(ta_stealthThreshold, 50.0f);
 
-    g_settings.maxVelocity          = ta_to_float(ta_maxVelocity, 8.0f);
-    g_settings.maxAcceleration      = ta_to_float(ta_maxAcceleration, 5.0f);
-    g_settings.startVelocity        = ta_to_float(ta_startVelocity, 0.5f);
-    g_settings.stopVelocity         = ta_to_float(ta_stopVelocity, 0.5f);
-    g_settings.firstVelocity        = ta_to_float(ta_firstVelocity, 2.0f);
-    g_settings.firstAcceleration    = ta_to_float(ta_firstAcceleration, 2.0f);
-    g_settings.maxDeceleration      = ta_to_float(ta_maxDeceleration, 5.0f);
-    g_settings.firstDeceleration    = ta_to_float(ta_firstDeceleration, 2.0f);
+    g_settings.maxVelocity =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_maxVelocity, 8.0f)
+        );
 
-    g_settings.mode                 = (dd_get_selected(dd_mode) == 0)
-                                        ? MotorControlScreen::MODE_REVOLUTIONS
-                                        : MotorControlScreen::MODE_DISTANCE_MM;
+    g_settings.maxAcceleration =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_maxAcceleration, 5.0f)
+        );
+
+    g_settings.startVelocity =
+        clamp_positive_to_min_executable(
+            ta_to_float(ta_startVelocity, 0.5f)
+        );
+
+    g_settings.stopVelocity =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_stopVelocity, 0.5f)
+        );
+
+    g_settings.firstVelocity =
+        clamp_positive_to_min_executable(
+            ta_to_float(ta_firstVelocity, 2.0f)
+        );
+
+    g_settings.firstAcceleration =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_firstAcceleration, 2.0f)
+        );
+
+    g_settings.maxDeceleration =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_maxDeceleration, 5.0f)
+        );
+
+    g_settings.firstDeceleration =
+        clamp_required_to_min_executable(
+            ta_to_float(ta_firstDeceleration, 2.0f)
+        );
+
+    if (dd_mode) {
+        g_settings.mode = (lv_dropdown_get_selected(dd_mode) == 0)
+                            ? MotorControlScreen::MODE_REVOLUTIONS
+                            : MotorControlScreen::MODE_DISTANCE_MM;
+    }
 
     g_settings.forwardValue         = ta_to_float(ta_forwardValue, 1.0f);
     g_settings.backwardValue        = 0.0f;
@@ -404,6 +523,27 @@ void push_settings_to_ui_internal()
 // =========================
 // SPI initialization
 // =========================
+static void enable_motor_driver_output()
+{
+    // TMC ENN is usually active-low:
+    // LOW  = driver enabled
+    // HIGH = driver disabled
+    pinMode(ENABLE_HARDWARE_PIN, OUTPUT);
+    digitalWrite(ENABLE_HARDWARE_PIN, LOW);
+
+    motor_driver_disabled = false;
+}
+
+static void disable_motor_driver_output()
+{
+    // TMC ENN is usually active-low:
+    // HIGH = driver disabled
+    pinMode(ENABLE_HARDWARE_PIN, OUTPUT);
+    digitalWrite(ENABLE_HARDWARE_PIN, HIGH);
+
+    motor_driver_disabled = true;
+}
+
 bool init_motor_spi_system_internal()
 {
     motor_spi_ready = false;
@@ -426,6 +566,10 @@ bool init_motor_spi_system_internal()
 
     pinMode(PIN_OE, OUTPUT);
     digitalWrite(PIN_OE, HIGH);
+
+    pinMode(ENABLE_HARDWARE_PIN, OUTPUT);
+    enable_motor_driver_output();
+
     delay(10);
 
     auto spi_parameters =
@@ -440,6 +584,12 @@ bool init_motor_spi_system_internal()
 
     auto driver_parameters_real =
         tmc51x0::DriverParameters{}
+            // // spreadCycle Only
+            // .withRunCurrent((uint8_t)g_settings.runCurrentPercent)
+            // .withMotorDirection(tmc51x0::ForwardDirection)
+            // .withChopperMode(tmc51x0::SpreadCycleMode)
+            // .withStealthChopEnabled(false);
+            // For stealth mode
             .withRunCurrent((uint8_t)g_settings.runCurrentPercent)
             .withPwmOffset((uint8_t)g_settings.pwmOffsetPercent)
             .withPwmGradient((uint8_t)g_settings.pwmGradientPercent)
@@ -500,7 +650,9 @@ bool init_motor_spi_system_internal()
         return false;
     }
 
+    enable_motor_driver_output();
     stepper.driver.enable();
+    motor_driver_disabled = false;
 
     stepper.controller.beginRampToZeroVelocity();
 
@@ -565,7 +717,7 @@ void start_motion_internal()
     // Direction dropdown:
     // 0 = Forward
     // 1 = Reverse
-    if (dd_get_selected(dd_direction) == 1) {
+    if (g_settings.reverseDirection) {
         target = -target;
     }
 
@@ -601,6 +753,81 @@ void stop_motion_internal()
     motor_stop_ramping = true;
 
     set_status("Stopping");
+}
+
+void force_disable_motor_internal()
+{
+    if (motor_spi_ready) {
+        // Stop any ramp-to-zero state first.
+        stepper.controller.endRampToZeroVelocity();
+
+        // Read current real chip position before disabling.
+        int32_t actual_chip = stepper.controller.readActualPosition();
+
+        // Critical:
+        // Cancel the previous motion command by making XTARGET = XACTUAL.
+        // This prevents the next enable/start from continuing the old extrusion target.
+        stepper.controller.writeTargetPosition(actual_chip);
+
+        current_target_chip = actual_chip;
+
+        delay(2);
+
+        // Disable TMC driver output by software.
+        stepper.driver.disable();
+    }
+
+    // Disable hardware ENN pin.
+    disable_motor_driver_output();
+
+    motor_is_running = false;
+    motor_stop_ramping = false;
+    motor_spi_ready = false;
+
+    // Do NOT reset current_target_chip to 0 here.
+    // It was already synced to actual position above.
+    motor_start_ms = 0;
+
+    set_status("Motor force disabled");
+    Serial.println("[MotorControlScreen] Motor force disabled");
+}
+
+void disable_motor_internal()
+{
+    if (motor_is_running || motor_stop_ramping) {
+        set_status("Cannot disable while moving");
+        return;
+    }
+
+    if (motor_spi_ready) {
+        stepper.controller.beginRampToZeroVelocity();
+
+        unsigned long t0 = millis();
+        while (!stepper.controller.zeroVelocity()) {
+            if (millis() - t0 > 1000) {
+                break;
+            }
+            delay(5);
+        }
+
+        stepper.controller.endRampToZeroVelocity();
+
+        // Also cancel any remaining target before disabling.
+        int32_t actual_chip = stepper.controller.readActualPosition();
+        stepper.controller.writeTargetPosition(actual_chip);
+        current_target_chip = actual_chip;
+
+        stepper.driver.disable();
+    }
+
+    disable_motor_driver_output();
+
+    motor_is_running = false;
+    motor_stop_ramping = false;
+    motor_spi_ready = false;
+
+    set_status("Motor disabled");
+    Serial.println("[MotorControlScreen] Motor driver output disabled");
 }
 
 void update_spi_motion_internal()
@@ -673,6 +900,15 @@ void back_btn_event_cb(lv_event_t* e)
 {
     LV_UNUSED(e);
 
+    if (kb_numeric) {
+        lv_obj_add_flag(kb_numeric, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    clear_active_textarea();
+
+    // ← 加這行，離開前先把當前 UI 值存回 g_settings
+    pull_settings_from_ui_internal();
+
     if (main_screen_obj) {
         lv_scr_load(main_screen_obj);
     }
@@ -706,7 +942,7 @@ void build()
 
     // ===== Motion command =====
     create_title(screen_obj, "Mode", 20, 65);
-    dd_mode = create_dropdown(screen_obj, 20, 95, "Revolutions\nDistance(mm)");
+    dd_mode = create_dropdown(screen_obj, 20, 95, "Revolution\nDistance(mm)");
 
     create_title(screen_obj, "Direction", 210, 65);
     dd_direction = create_dropdown(screen_obj, 210, 95, "Forward\nReverse");
@@ -722,41 +958,43 @@ void build()
 
     // ===== Driver params =====
     create_title(screen_obj, "RunCurrent %", 20, 145);
-    ta_runCurrent = create_textarea(screen_obj, 20, 175, "80");
+    ta_runCurrent = create_textarea(screen_obj, 20, 175, "40");
 
+    //----- For StealthThr Mode -----
     create_title(screen_obj, "PwmOffset %", 210, 145);
-    ta_pwmOffset = create_textarea(screen_obj, 210, 175, "40");
+    ta_pwmOffset = create_textarea(screen_obj, 210, 175, "35");
 
     create_title(screen_obj, "PwmGradient %", 400, 145);
     ta_pwmGradient = create_textarea(screen_obj, 400, 175, "15");
 
     create_title(screen_obj, "StealthThr", 20, 225);
     ta_stealthThreshold = create_textarea(screen_obj, 20, 255, "50");
+    //----- For StealthThr Mode -----
 
     // ===== Controller params =====
     create_title(screen_obj, "MaxVel", 20, 390);
-    ta_maxVelocity = create_textarea(screen_obj, 20, 420, "10");
+    ta_maxVelocity = create_textarea(screen_obj, 20, 420, "0.3");
 
     create_title(screen_obj, "MaxAcc", 210, 390);
-    ta_maxAcceleration = create_textarea(screen_obj, 210, 420, "5");
+    ta_maxAcceleration = create_textarea(screen_obj, 210, 420, "0.1");
 
     create_title(screen_obj, "StartVel", 210, 225);
-    ta_startVelocity = create_textarea(screen_obj, 210, 255, "0.5");
+    ta_startVelocity = create_textarea(screen_obj, 210, 255, "0.0");
 
     create_title(screen_obj, "StopVel", 400, 225);
-    ta_stopVelocity = create_textarea(screen_obj, 400, 255, "0.5");
+    ta_stopVelocity = create_textarea(screen_obj, 400, 255, "0.001");
 
     create_title(screen_obj, "FirstVel", 20, 310);
-    ta_firstVelocity = create_textarea(screen_obj, 20, 340, "1.0");
+    ta_firstVelocity = create_textarea(screen_obj, 20, 340, "0.0");
 
     create_title(screen_obj, "FirstAcc", 210, 310);
-    ta_firstAcceleration = create_textarea(screen_obj, 210, 340, "2");
+    ta_firstAcceleration = create_textarea(screen_obj, 210, 340, "0.1");
 
     create_title(screen_obj, "MaxDec", 400, 390);
-    ta_maxDeceleration = create_textarea(screen_obj, 400, 420, "5");
+    ta_maxDeceleration = create_textarea(screen_obj, 400, 420, "0.1");
 
     create_title(screen_obj, "FirstDec", 400, 310);
-    ta_firstDeceleration = create_textarea(screen_obj, 400, 340, "2");
+    ta_firstDeceleration = create_textarea(screen_obj, 400, 340, "0.1");
 
     // ===== Buttons =====
     btn_start = lv_btn_create(screen_obj);
@@ -842,6 +1080,10 @@ lv_obj_t** getScreenHandle()
 
 void update()
 {
+    if (motor_driver_disabled) {
+        return;
+    }
+
     update_spi_motion_internal();
 }
 
@@ -907,8 +1149,8 @@ void setSettings(const MotorSpiSettings& settings)
 void resetSettingsToDefault()
 {
     g_settings = {
-        80.0f,
-        40.0f,
+        75.0f,
+        35.0f,
         15.0f,
         true,
         50.0f,
@@ -920,7 +1162,7 @@ void resetSettingsToDefault()
         0.05f,
         0.1f,
         0.05f,
-        MODE_REVOLUTIONS,
+        MODE_DISTANCE_MM,
         1.0f,
         1.0f
     };
@@ -950,6 +1192,16 @@ void stopMotion()
     stop_motion_internal();
 }
 
+void disableMotor()
+{
+    disable_motor_internal();
+}
+
+void forceDisableMotor()
+{
+    force_disable_motor_internal();
+}
+
 int32_t computeTargetChipFromMode(float value, MotionInputMode mode)
 {
     return compute_target_chip_from_mode_internal(value, mode);
@@ -963,6 +1215,125 @@ bool isReady()
 bool isRunning()
 {
     return motor_is_running;
+}
+
+void print_final_motor_settings_before_tmc()
+{
+    Serial.println("========== FINAL MOTOR SETTINGS BEFORE TMC ==========");
+
+    Serial.print("maxVelocity = ");
+    Serial.println(g_settings.maxVelocity, 6);
+
+    Serial.print("maxAcceleration = ");
+    Serial.println(g_settings.maxAcceleration, 6);
+
+    Serial.print("maxDeceleration = ");
+    Serial.println(g_settings.maxDeceleration, 6);
+
+    Serial.print("startVelocity = ");
+    Serial.println(g_settings.startVelocity, 6);
+
+    Serial.print("stopVelocity = ");
+    Serial.println(g_settings.stopVelocity, 6);
+
+    Serial.print("firstVelocity = ");
+    Serial.println(g_settings.firstVelocity, 6);
+
+    Serial.print("firstAcceleration = ");
+    Serial.println(g_settings.firstAcceleration, 6);
+
+    Serial.print("firstDeceleration = ");
+    Serial.println(g_settings.firstDeceleration, 6);
+
+    Serial.print("POSITION_SCALE_FACTOR = ");
+    Serial.println(POSITION_SCALE_FACTOR, 6);
+
+    Serial.print("min executable value = ");
+    Serial.println(min_executable_motion_value(), 6);
+
+    Serial.println("=====================================================");
+}
+
+static float estimate_motion_duration_s(
+    float distance_mm,
+    float max_velocity_mm_s,
+    float acceleration_mm_s2,
+    float deceleration_mm_s2,
+    float start_velocity_mm_s,
+    float stop_velocity_mm_s
+)
+{
+    if (
+        distance_mm <= 0.0f ||
+        max_velocity_mm_s <= 0.0f ||
+        acceleration_mm_s2 <= 0.0f ||
+        deceleration_mm_s2 <= 0.0f
+    ) {
+        return 0.0f;
+    }
+
+    if (start_velocity_mm_s < 0.0f) start_velocity_mm_s = 0.0f;
+    if (stop_velocity_mm_s < 0.0f) stop_velocity_mm_s = 0.0f;
+
+    if (start_velocity_mm_s > max_velocity_mm_s) {
+        start_velocity_mm_s = max_velocity_mm_s;
+    }
+
+    if (stop_velocity_mm_s > max_velocity_mm_s) {
+        stop_velocity_mm_s = max_velocity_mm_s;
+    }
+
+    float d_acc =
+        (max_velocity_mm_s * max_velocity_mm_s -
+         start_velocity_mm_s * start_velocity_mm_s)
+        / (2.0f * acceleration_mm_s2);
+
+    float d_dec =
+        (max_velocity_mm_s * max_velocity_mm_s -
+         stop_velocity_mm_s * stop_velocity_mm_s)
+        / (2.0f * deceleration_mm_s2);
+
+    // trapezoid profile
+    if ((d_acc + d_dec) <= distance_mm) {
+        float t_acc =
+            (max_velocity_mm_s - start_velocity_mm_s) / acceleration_mm_s2;
+
+        float t_dec =
+            (max_velocity_mm_s - stop_velocity_mm_s) / deceleration_mm_s2;
+
+        float t_const =
+            (distance_mm - d_acc - d_dec) / max_velocity_mm_s;
+
+        return t_acc + t_const + t_dec;
+    }
+
+    // triangular profile
+    float v_peak_sq =
+        (
+            2.0f * distance_mm * acceleration_mm_s2 * deceleration_mm_s2 +
+            deceleration_mm_s2 * start_velocity_mm_s * start_velocity_mm_s +
+            acceleration_mm_s2 * stop_velocity_mm_s * stop_velocity_mm_s
+        ) /
+        (acceleration_mm_s2 + deceleration_mm_s2);
+
+    if (v_peak_sq < 0.0f) {
+        return 0.0f;
+    }
+
+    float v_peak = sqrtf(v_peak_sq);
+
+    float t_acc = 0.0f;
+    float t_dec = 0.0f;
+
+    if (v_peak > start_velocity_mm_s) {
+        t_acc = (v_peak - start_velocity_mm_s) / acceleration_mm_s2;
+    }
+
+    if (v_peak > stop_velocity_mm_s) {
+        t_dec = (v_peak - stop_velocity_mm_s) / deceleration_mm_s2;
+    }
+
+    return t_acc + t_dec;
 }
 
 // =========================
@@ -1009,17 +1380,32 @@ bool startExtrusionMove(const TmcRampCommand& cmd)
         return false;
     }
 
+    // Backup manual Motor Control settings.
+    // SETTING extrusion must not permanently overwrite manual UI settings.
+    MotorSpiSettings manual_settings_backup = g_settings;
+    bool extrusion_reverse = cmd.reverse_direction;
+
     // Pull driver-level settings from UI first.
     // Then override motion ramp settings using planner output.
     pull_settings_from_ui_internal();
 
-    g_settings.maxVelocity       = cmd.max_velocity_mm_s;
-    g_settings.maxAcceleration   = cmd.max_acceleration_mm_s2;
-    g_settings.maxDeceleration   = cmd.max_deceleration_mm_s2;
+    g_settings.runCurrentPercent = 75.0f;
+    g_settings.pwmOffsetPercent = 35.0f;
+    g_settings.pwmGradientPercent = 15.0f;
 
-    g_settings.startVelocity = cmd.start_velocity_mm_s;
+    g_settings.maxVelocity =
+        clamp_required_to_min_executable(cmd.max_velocity_mm_s);
 
-    float safe_stop_velocity = 0.001f;
+    g_settings.maxAcceleration =
+        clamp_required_to_min_executable(cmd.max_acceleration_mm_s2);
+
+    g_settings.maxDeceleration =
+        clamp_required_to_min_executable(cmd.max_deceleration_mm_s2);
+
+    g_settings.startVelocity =
+        clamp_positive_to_min_executable(cmd.start_velocity_mm_s);
+
+    float safe_stop_velocity = min_executable_motion_value();
 
     if (safe_stop_velocity >= cmd.max_velocity_mm_s) {
         safe_stop_velocity = cmd.max_velocity_mm_s * 0.5f;
@@ -1027,26 +1413,35 @@ bool startExtrusionMove(const TmcRampCommand& cmd)
 
     g_settings.stopVelocity =
         (cmd.stop_velocity_mm_s > 0.0f)
-        ? cmd.stop_velocity_mm_s
+        ? clamp_required_to_min_executable(cmd.stop_velocity_mm_s)
         : safe_stop_velocity;
 
-    g_settings.firstVelocity = cmd.first_velocity_mm_s;
+    if (g_settings.stopVelocity >= g_settings.maxVelocity) {
+        g_settings.stopVelocity = g_settings.maxVelocity * 0.5f;
+    }
+
+    g_settings.firstVelocity =
+        clamp_positive_to_min_executable(cmd.first_velocity_mm_s);
 
     g_settings.firstAcceleration =
-        (cmd.first_acceleration_mm_s2 > 0.0f)
-        ? cmd.first_acceleration_mm_s2
-        : 0.005f;
+        clamp_required_to_min_executable(cmd.first_acceleration_mm_s2);
 
     g_settings.firstDeceleration =
-        (cmd.first_deceleration_mm_s2 > 0.0f)
-        ? cmd.first_deceleration_mm_s2
-        : 0.005f;
+        clamp_required_to_min_executable(cmd.first_deceleration_mm_s2);
 
-    g_settings.reverseDirection  = cmd.reverse_direction;
+    //===== TMC RAMP COMMAND Moniter =====//
+    print_final_motor_settings_before_tmc();
 
     if (!init_motor_spi_system_internal()) {
+        g_settings = manual_settings_backup;
+        push_settings_to_ui_internal();
         return false;
     }
+
+    // TMC chip has already received the extrusion ramp settings.
+    // Restore manual Motor Control settings after hardware setup.
+    g_settings = manual_settings_backup;
+    push_settings_to_ui_internal();
 
     int32_t target_chip =
         compute_target_chip_from_mode_internal(
@@ -1054,7 +1449,7 @@ bool startExtrusionMove(const TmcRampCommand& cmd)
             MODE_DISTANCE_MM
         );
 
-    if (g_settings.reverseDirection) {
+    if (extrusion_reverse) {
         target_chip = -target_chip;
     }
 
@@ -1082,6 +1477,12 @@ bool motionFinished()
     if (motor_stop_ramping) {
         if (stepper.controller.zeroVelocity()) {
             stepper.controller.endRampToZeroVelocity();
+
+            // After controlled stop, make current position the new target.
+            int32_t actual_chip = stepper.controller.readActualPosition();
+            stepper.controller.writeTargetPosition(actual_chip);
+            current_target_chip = actual_chip;
+
             motor_stop_ramping = false;
             motor_is_running = false;
             set_status("Stopped");
@@ -1100,10 +1501,120 @@ bool motionFinished()
     return false;
 }
 
+// Convert TMC chip position back to physical linear distance in mm.
+// This uses the same conversion chain as update_spi_motion_internal().
+static float chip_position_to_physical_distance_mm(int32_t chip_position)
+{
+    float controller_pos_mm =
+        stepper.converter.positionChipToReal(chip_position);
+
+    return from_controller_distance_mm(controller_pos_mm);
+}
+
+float getTargetDistanceMm()
+{
+    if (!motor_spi_ready) {
+        return 0.0f;
+    }
+
+    return chip_position_to_physical_distance_mm(current_target_chip);
+}
+
+float getActualDistanceMm()
+{
+    if (!motor_spi_ready) {
+        return 0.0f;
+    }
+
+    int32_t actual_chip =
+        stepper.controller.readActualPosition();
+
+    return chip_position_to_physical_distance_mm(actual_chip);
+}
+
 float getMeasuredCurrentA()
 {
     if (!motor_spi_ready) return 0.0f;
     return ina228.getCurrent_mA() / 1000.0f;
+}
+
+void forceStopState()
+{
+    if (motor_spi_ready) {
+        stepper.controller.endRampToZeroVelocity();
+
+        int32_t actual_chip = stepper.controller.readActualPosition();
+        stepper.controller.writeTargetPosition(actual_chip);
+        current_target_chip = actual_chip;
+    }
+
+    motor_is_running = false;
+    motor_stop_ramping = false;
+    motor_start_ms = 0;
+
+    set_status("Forced stopped");
+}
+
+float estimateExecutableDurationS(const TmcRampCommand& cmd)
+{
+    if (!cmd.valid || cmd.target_distance_mm <= 0.0f) {
+        return 0.0f;
+    }
+
+    float max_velocity =
+        clamp_required_to_min_executable(cmd.max_velocity_mm_s);
+
+    float max_acceleration =
+        clamp_required_to_min_executable(cmd.max_acceleration_mm_s2);
+
+    float max_deceleration =
+        clamp_required_to_min_executable(cmd.max_deceleration_mm_s2);
+
+    float start_velocity =
+        clamp_positive_to_min_executable(cmd.start_velocity_mm_s);
+
+    float safe_stop_velocity = min_executable_motion_value();
+
+    if (safe_stop_velocity >= cmd.max_velocity_mm_s) {
+        safe_stop_velocity = cmd.max_velocity_mm_s * 0.5f;
+    }
+
+    float stop_velocity =
+        (cmd.stop_velocity_mm_s > 0.0f)
+        ? clamp_required_to_min_executable(cmd.stop_velocity_mm_s)
+        : safe_stop_velocity;
+
+    if (stop_velocity >= max_velocity) {
+        stop_velocity = max_velocity * 0.5f;
+    }
+
+    float first_acceleration =
+        clamp_required_to_min_executable(cmd.first_acceleration_mm_s2);
+
+    float first_deceleration =
+        clamp_required_to_min_executable(cmd.first_deceleration_mm_s2);
+
+    // 保守估算：使用比較慢的加速度/減速度
+    float effective_acceleration =
+        (first_acceleration < max_acceleration)
+        ? first_acceleration
+        : max_acceleration;
+
+    float effective_deceleration =
+        (first_deceleration < max_deceleration)
+        ? first_deceleration
+        : max_deceleration;
+
+    float duration_s = estimate_motion_duration_s(
+        cmd.target_distance_mm,
+        max_velocity,
+        effective_acceleration,
+        effective_deceleration,
+        start_velocity,
+        stop_velocity
+    );
+
+    return duration_s;
 }
 
 } // namespace MotorControlScreen

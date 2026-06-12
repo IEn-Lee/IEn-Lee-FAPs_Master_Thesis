@@ -8,7 +8,11 @@ namespace CustomizedParametersScreen {
 
 // ===== Parameter indices =====
 enum ParamIndex {
-    DEV_P_VISCOSITY = 0,
+    // Needle or cannula
+    DEV_P_r = 0,
+    DEV_P_l,
+
+    DEV_P_VISCOSITY,
 
     // Syringe and motion conversion
     DEV_P_STROKE_PER_ML_MM,
@@ -25,10 +29,6 @@ enum ParamIndex {
     DEV_P_SHAFT,
     DEV_P_SHAFT_WALL,
     DEV_P_E,
-
-    // Needle or cannula
-    DEV_P_r,
-    DEV_P_l,
 
     DEV_P_COUNT
 };

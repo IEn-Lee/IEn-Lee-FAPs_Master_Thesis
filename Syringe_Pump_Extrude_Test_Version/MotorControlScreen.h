@@ -21,6 +21,9 @@ void update();
 void destroy();
 void destroyAsync(void* user_data);
 
+void forceStopState();
+void forceDisableMotor();
+
 // =========================
 // Motion input mode
 // =========================
@@ -74,6 +77,7 @@ void pushSettingsToUi();
 // =========================
 bool initMotorSpiSystem();
 void stopMotion();
+void disableMotor();
 
 // Convert motion value to chip target position
 int32_t computeTargetChipFromMode(float value, MotionInputMode mode);
@@ -84,7 +88,14 @@ bool isRunning();
 
 bool startExtrusionMove(const TmcRampCommand& cmd);
 bool motionFinished();
+
+float getTargetDistanceMm();
+float getActualDistanceMm();
+
 float getMeasuredCurrentA();
+
+// For estimating real executable durations
+float estimateExecutableDurationS(const TmcRampCommand& cmd);
 
 } // namespace MotorControlScreen
 

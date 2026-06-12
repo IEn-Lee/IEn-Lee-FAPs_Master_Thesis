@@ -20,6 +20,7 @@ static lv_obj_t* save_done_dialog = NULL;
 
 // ===== style =====
 static lv_style_t st_cell;
+static lv_style_t st_cell_focused;
 static bool st_cell_inited = false;
 
 // ===== row definition =====
@@ -33,6 +34,10 @@ static ParamRow rows[DEV_P_COUNT];
 
 // ===== store =====
 static ParamValue param_store[DEV_P_COUNT] = {
+    // Needle or cannula
+    {"r", "m", "0.000257", ""},
+    {"l", "m", "0.022", ""},
+
     {"viscosity", "mPa.s", "60000", ""},
 
     // Syringe and motion conversion
@@ -49,11 +54,7 @@ static ParamValue param_store[DEV_P_COUNT] = {
     {"L", "m", "0.062", ""},
     {"shaft", "m", "0.0093", ""},
     {"shaft_walls", "m", "0.0008", ""},
-    {"E", "Pa", "1e9", ""},
-
-    // Needle or cannula
-    {"r", "m", "0.00013", ""},
-    {"l", "m", "0.012", ""}
+    {"E", "Pa", "1e9", ""}
 };
 
 // ===== keypad map =====
@@ -71,6 +72,7 @@ static void initCellStyle()
     if (st_cell_inited) return;
     st_cell_inited = true;
 
+    // Normal input cell style
     lv_style_init(&st_cell);
     lv_style_set_radius(&st_cell, 8);
     lv_style_set_border_width(&st_cell, 1);
@@ -78,71 +80,108 @@ static void initCellStyle()
     lv_style_set_bg_opa(&st_cell, LV_OPA_COVER);
     lv_style_set_bg_color(&st_cell, lv_color_hex(0xFFFFFF));
     lv_style_set_pad_all(&st_cell, 10);
+
+    // Focused input cell style
+    // This appears only while the textarea has LV_STATE_FOCUSED.
+    lv_style_init(&st_cell_focused);
+    lv_style_set_border_width(&st_cell_focused, 3);
+    lv_style_set_border_color(&st_cell_focused, lv_color_hex(0x007ACC));
+    lv_style_set_bg_color(&st_cell_focused, lv_color_hex(0xF7FBFF));
+}
+
+static void clearActiveTextArea()
+{
+    if (kb_target_ta) {
+        lv_obj_clear_state(kb_target_ta, LV_STATE_FOCUSED);
+        lv_obj_invalidate(kb_target_ta);
+        kb_target_ta = NULL;
+    }
 }
 
 static void kbEventCb(lv_event_t* e)
 {
     lv_obj_t* kb = lv_event_get_target(e);
-    const char* txt = lv_btnmatrix_get_btn_text(kb, lv_btnmatrix_get_selected_btn(kb));
-    if (!txt || !kb_target_ta) return;
+
+    uint16_t btn_id = lv_btnmatrix_get_selected_btn(kb);
+    if (btn_id == LV_BTNMATRIX_BTN_NONE) return;
+
+    const char* txt = lv_btnmatrix_get_btn_text(kb, btn_id);
+    if (!txt) return;
+
+    // ENTER: hide keyboard and remove blue border
+    if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0 || strcmp(txt, "\n") == 0) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        clearActiveTextArea();
+        return;
+    }
+
+    if (!kb_target_ta) return;
 
     if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
         lv_textarea_del_char(kb_target_ta);
+        return;
     }
-    else if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-        kb_target_ta = NULL;
+
+    const char* cur = lv_textarea_get_text(kb_target_ta);
+    if (!cur) cur = "";
+
+    // Only one decimal point before exponent.
+    if (strcmp(txt, ".") == 0) {
+        const char* e_pos = strchr(cur, 'e');
+        if (e_pos) {
+            return;
+        }
+        if (strchr(cur, '.') != NULL) {
+            return;
+        }
     }
-    else {
-        const char* cur = lv_textarea_get_text(kb_target_ta);
-        if (!cur) cur = "";
 
-        // Only one decimal point before exponent.
-        if (strcmp(txt, ".") == 0) {
-            const char* e_pos = strchr(cur, 'e');
-            if (e_pos) {
-                return;
-            }
-            if (strchr(cur, '.') != NULL) {
-                return;
-            }
+    // Only one exponent marker.
+    if (strcmp(txt, "e") == 0) {
+        if (strlen(cur) == 0) {
+            return;
         }
-
-        // Only one exponent marker.
-        if (strcmp(txt, "e") == 0) {
-            if (strlen(cur) == 0) {
-                return;
-            }
-            if (strchr(cur, 'e') != NULL) {
-                return;
-            }
+        if (strchr(cur, 'e') != NULL) {
+            return;
         }
+    }
 
-        // '-' is allowed only as first char or immediately after 'e'.
-        if (strcmp(txt, "-") == 0) {
-            size_t len = strlen(cur);
+    // '-' is allowed only as first char or immediately after 'e'.
+    if (strcmp(txt, "-") == 0) {
+        size_t len = strlen(cur);
 
-            if (len == 0) {
-                lv_textarea_add_text(kb_target_ta, txt);
-                return;
-            }
-
-            if (cur[len - 1] == 'e') {
-                lv_textarea_add_text(kb_target_ta, txt);
-                return;
-            }
-
+        if (len == 0) {
+            lv_textarea_add_text(kb_target_ta, txt);
             return;
         }
 
-        lv_textarea_add_text(kb_target_ta, txt);
+        if (cur[len - 1] == 'e') {
+            lv_textarea_add_text(kb_target_ta, txt);
+            return;
+        }
+
+        return;
     }
+
+    lv_textarea_add_text(kb_target_ta, txt);
 }
 
 static void attachKeyboardTo(lv_obj_t* ta)
 {
-    if (!kb_obj) return;
+    if (!kb_obj || !ta) return;
+
+    // If another textarea was active, remove its blue border first.
+    if (kb_target_ta && kb_target_ta != ta) {
+        lv_obj_clear_state(kb_target_ta, LV_STATE_FOCUSED);
+        lv_obj_invalidate(kb_target_ta);
+    }
+
     kb_target_ta = ta;
+
+    // Current textarea becomes active.
+    lv_obj_add_state(kb_target_ta, LV_STATE_FOCUSED);
+    lv_obj_invalidate(kb_target_ta);
+
     lv_obj_clear_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(kb_obj);
 }
@@ -212,7 +251,10 @@ static lv_obj_t* createTableRow(
 
     lv_obj_t* ta = lv_textarea_create(row);
     lv_obj_remove_style_all(ta);
-    lv_obj_add_style(ta, &st_cell, 0);
+
+    lv_obj_add_style(ta, &st_cell, LV_PART_MAIN);
+    lv_obj_add_style(ta, &st_cell_focused, LV_PART_MAIN | LV_STATE_FOCUSED);
+
     lv_obj_set_size(ta, 340, 68);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_placeholder_text(ta, placeholder ? placeholder : "");
@@ -291,8 +333,8 @@ static void showDoneDialog(const char* msg)
     lv_obj_set_style_text_font(label, &montserrat_34, 0);
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
 
-    // auto close after 3000 ms
-    done_timer = lv_timer_create(doneTimerCb, 3000, dialog);
+    // auto close after 1300 ms
+    done_timer = lv_timer_create(doneTimerCb, 1300, dialog);
     lv_timer_set_repeat_count(done_timer, 1);
 }
 
@@ -354,6 +396,11 @@ static void backBtnEventCb(lv_event_t* e)
 {
     LV_UNUSED(e);
 
+    if (kb_obj) {
+        lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+    clearActiveTextArea();
+
     if (main_screen_obj) {
         lv_scr_load(main_screen_obj);
     }
@@ -373,8 +420,10 @@ static void saveBtnEventCb(lv_event_t* e)
     //     kb_target_ta = NULL;
     // }
 
-    if (kb_obj) lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
-    kb_target_ta = NULL;
+    if (kb_obj) {
+        lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+    clearActiveTextArea();
 
     saveParameters();
 
@@ -522,11 +571,19 @@ void build()
     createKeyboard(screen_obj);
 
     // ===== build() rows =====
-    createTableRow(scroll_obj, "viscosity", "Fluid dynamic viscosity", "e.g. 60000", &rows[DEV_P_VISCOSITY].ta);
-    rows[DEV_P_VISCOSITY].key = "viscosity";
-    rows[DEV_P_VISCOSITY].unit = "mPa.s";
+    createTableRow(scroll_obj, "r (cannula, m)", "Cannula inner radius", "e.g. 0.000257", &rows[DEV_P_r].ta);
+    rows[DEV_P_r].key = "r";
+    rows[DEV_P_r].unit = "m";
 
-    createTableRow(scroll_obj, "stroke / 1 mL", "Linear stroke needed for 1 mL", "e.g. 13.0", &rows[DEV_P_STROKE_PER_ML_MM].ta);
+    createTableRow(scroll_obj, "l (cannula, m)", "Cannula length", "e.g. 0.022", &rows[DEV_P_l].ta);
+    rows[DEV_P_l].key = "l";
+    rows[DEV_P_l].unit = "m";
+
+    // createTableRow(scroll_obj, "viscosity (mPa.s)", "Fluid dynamic viscosity", "e.g. 60000", &rows[DEV_P_VISCOSITY].ta);
+    // rows[DEV_P_VISCOSITY].key = "viscosity";
+    // rows[DEV_P_VISCOSITY].unit = "mPa.s";
+
+    createTableRow(scroll_obj, "stroke / 1 mL (mm)", "Linear stroke needed for 1 mL", "e.g. 13.0", &rows[DEV_P_STROKE_PER_ML_MM].ta);
     rows[DEV_P_STROKE_PER_ML_MM].key = "stroke_per_ml_mm";
     rows[DEV_P_STROKE_PER_ML_MM].unit = "mm";
 
@@ -542,38 +599,30 @@ void build()
     rows[DEV_P_I_LIMIT].key = "I_limit";
     rows[DEV_P_I_LIMIT].unit = "A";
 
-    createTableRow(scroll_obj, "I_plunger", "Second moment of area", "e.g. 8.0927e-11", &rows[DEV_P_I_PLUNGER].ta);
+    createTableRow(scroll_obj, "I_plunger (m^4)", "Second moment of area", "e.g. 8.0927e-11", &rows[DEV_P_I_PLUNGER].ta);
     rows[DEV_P_I_PLUNGER].key = "I_plunger";
     rows[DEV_P_I_PLUNGER].unit = "m^4";
 
     // remaining original order
-    createTableRow(scroll_obj, "R", "Plunger tip radius", "e.g. 0.0049", &rows[DEV_P_R].ta);
+    createTableRow(scroll_obj, "R (m)", "Plunger tip radius", "e.g. 0.0049", &rows[DEV_P_R].ta);
     rows[DEV_P_R].key = "R";
     rows[DEV_P_R].unit = "m";
 
-    createTableRow(scroll_obj, "L", "Plunger length", "e.g. 0.062", &rows[DEV_P_L].ta);
+    createTableRow(scroll_obj, "L (m)", "Plunger length", "e.g. 0.062", &rows[DEV_P_L].ta);
     rows[DEV_P_L].key = "L";
     rows[DEV_P_L].unit = "m";
 
-    createTableRow(scroll_obj, "shaft", "Plunger shaft outer width", "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
+    createTableRow(scroll_obj, "shaft (m)", "Plunger shaft outer width", "e.g. 0.0093", &rows[DEV_P_SHAFT].ta);
     rows[DEV_P_SHAFT].key = "shaft";
     rows[DEV_P_SHAFT].unit = "m";
 
-    createTableRow(scroll_obj, "shaft wall", "Shaft wall thickness", "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
+    createTableRow(scroll_obj, "shaft wall (m)", "Shaft wall thickness", "e.g. 0.0008", &rows[DEV_P_SHAFT_WALL].ta);
     rows[DEV_P_SHAFT_WALL].key = "shaft_walls";
     rows[DEV_P_SHAFT_WALL].unit = "m";
 
-    createTableRow(scroll_obj, "E", "Elastic modulus", "e.g. 1e9", &rows[DEV_P_E].ta);
+    createTableRow(scroll_obj, "E (Pa)", "Elastic modulus", "e.g. 1e9", &rows[DEV_P_E].ta);
     rows[DEV_P_E].key = "E";
     rows[DEV_P_E].unit = "Pa";
-
-    createTableRow(scroll_obj, "r (cannula)", "Cannula inner radius", "e.g. 0.00013", &rows[DEV_P_r].ta);
-    rows[DEV_P_r].key = "r";
-    rows[DEV_P_r].unit = "m";
-
-    createTableRow(scroll_obj, "l (cannula)", "Cannula length", "e.g. 0.012", &rows[DEV_P_l].ta);
-    rows[DEV_P_l].key = "l";
-    rows[DEV_P_l].unit = "m";
 
     for (int i = 0; i < DEV_P_COUNT; i++) {
         if (rows[i].ta) {
@@ -615,8 +664,10 @@ void build()
 
         LV_UNUSED(e);
 
-        if (kb_obj) lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
-        kb_target_ta = NULL;
+        if (kb_obj) {
+            lv_obj_add_flag(kb_obj, LV_OBJ_FLAG_HIDDEN);
+        }
+        clearActiveTextArea();
 
         resetParametersToDefault();
 

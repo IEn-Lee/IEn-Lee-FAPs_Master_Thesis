@@ -55,7 +55,7 @@ public:
         shaft(0.0093f),
         shaft_walls(0.0008f),
         E(1.0e9f),
-        S(3.0f),
+        S(3.0f), // Safety factor
         r(0.00013f),
         l(0.012f),
         lead_pitch(0.0015f),
@@ -72,7 +72,7 @@ public:
         friction_force_N(0.0f),
         acceleration_utilization(1.0f),
         use_load_terms_for_accel(true),
-        K_buckling(0.5f),
+        K_buckling(1.0f),
         I_plunger(8.0927e-11f)
         {}
     };

@@ -102,6 +102,19 @@ static lv_obj_t* manual_screen_tab3 = NULL;
 static bool is_running = false;
 static lv_obj_t* start_btn = NULL;
 static lv_obj_t* confirm_dialog = NULL;
+// --- Retraction / Backdraw mode ---
+static lv_obj_t* retract_switch = NULL;
+static lv_obj_t* retract_switch_label = NULL;
+
+static bool retract_mode_enabled = false;        // UI目前設定
+static bool run_retract_mode_enabled = false;    // 本次運行鎖定的設定
+
+static bool retract_move_started = false;
+
+static const float RETRACT_DISTANCE_MM = 3.0f; // retract distance
+static const float RETRACT_MAX_VELOCITY_MM_S = 0.20f;
+static const float RETRACT_ACCEL_MM_S2 = 0.1f;
+static const float RETRACT_DECEL_MM_S2 = 0.1f;
 // --- Recorded parameters ---
 static const char* recorded_viscosity = NULL;
 static const char* recorded_quantity  = NULL;
@@ -126,12 +139,20 @@ static lv_obj_t* lbl_quantity = NULL;
 static lv_obj_t* lbl_remaining = NULL;
 static lv_obj_t* lbl_duration = NULL;
 static lv_obj_t* lbl_elapsed = NULL;
+static lv_obj_t* lbl_tmc_target_distance = NULL;
+static lv_obj_t* lbl_tmc_actual_distance = NULL;
+// TMC distance monitor cache.
+// Must be declared before show_start_confirm_dialog(), because the START lambda resets it.
+static float last_tmc_target_distance_mm = 0.0f;
+static float last_tmc_actual_distance_mm = 0.0f;
+static bool tmc_distance_frozen_after_extrusion = false;
 // --- Tab3 preview panels ---
 static lv_obj_t* tab3_volume_curve_panel = NULL;
 static lv_obj_t* tab3_current_curve_panel = NULL;
 // --- Tab3 control buttons ---
 static lv_obj_t* btn_tab3_parameter_setting = NULL;
 static lv_obj_t* btn_tab3_motor_control = NULL;
+static lv_obj_t* btn_tab3_disable_motor = NULL;
 // --- Motion planner runtime ---
 static PlungerMotionPlanner realtime_motion_planner;
 static bool realtime_motion_planner_valid = false;
@@ -145,6 +166,11 @@ static float realtime_curve_volume_max_uL = 1000.0f;
 static float realtime_curve_current_max_A = 3.0f;
 
 static unsigned long last_curve_update_ms = 0;
+// --- Current tail recording after motor finish ---
+static const float CURRENT_TAIL_SEC = 5.0f;      // motor finish 後多記錄 5 秒電流
+static float chart_total_duration_sec = 0.0f;    // chart X 軸總時間
+static bool current_tail_recording = false;
+static unsigned long current_tail_start_ms = 0;
 // --- Global Variables ---
 input_block_t* viscosity_block;
 input_block_t* quantity_block;
@@ -152,6 +178,54 @@ input_block_t* quantity_block;
 static bool stop_requested = false;
 static bool stop_requested_by_timeout = false;
 static unsigned long stop_request_ms = 0;
+// --- Display Duration Seconds ---
+static float extrusion_duration_sec_exact = 0.0f;
+static float retraction_duration_sec_exact = 0.0f;
+
+// 主擠出 + 回抽，不含 current tail
+static float operation_motion_duration_sec_exact = 0.0f;
+
+// UI 顯示與倒數用，包含保守估算
+static float display_duration_sec_exact = 0.0f;
+static int   display_duration_sec = 0;
+
+// 你目前 60000 mPas / 1 mL 實測：865.85 / 845.86 = 1.0236
+// 先用 1.024 修正模型低估問題
+static const float EXTRUSION_DURATION_CALIBRATION = 1.024f;
+static const float RETRACTION_DURATION_CALIBRATION = 1.000f;
+
+// 顯示給使用者看的保守 margin
+static const float DISPLAY_MARGIN_RATIO = 0.25f;
+static const float DISPLAY_MARGIN_MIN_SEC = 3.0f;
+
+// phase timeout margin
+// 一般 phase timeout 使用比例型 margin，不再使用固定 240 s 上限。
+static const float TIMEOUT_MARGIN_RATIO = 0.30f;
+static const float TIMEOUT_MARGIN_MIN_SEC = 30.0f;
+
+// 開啟 retraction 時，主擠出 phase 使用更寬鬆的比例型 timeout。
+// 目的：避免長時間高黏度擠出在 motionFinished() 之前被 timeout stop，導致 retraction 無法觸發。
+static const float RETRACTION_EXTRUSION_TIMEOUT_RATIO = 0.50f;
+static const float RETRACTION_EXTRUSION_TIMEOUT_MIN_SEC = 300.0f;
+
+// Clear residual value of countdown
+static bool system_progress_force_remaining_zero = false;
+static bool system_progress_force_complete = false;
+static bool system_progress_tail_ramp_active = false;
+static float system_progress_tail_start_percent = 0.0f;
+static unsigned long system_progress_tail_start_ms = 0;
+
+// retarct manager
+enum RunPhase {
+    RUN_PHASE_IDLE,
+    RUN_PHASE_EXTRUDING,
+    RUN_PHASE_RETRACTING,
+    RUN_PHASE_TAIL_RECORDING
+};
+//
+
+static RunPhase run_phase = RUN_PHASE_IDLE;
+static unsigned long phase_start_ms = 0;
 
 typedef struct {
     const char* key;
@@ -233,13 +307,19 @@ static void start_btn_event_cb(lv_event_t* e)
             return;
         }
 
+        // 鎖定本次確認視窗使用的回抽模式
+        run_retract_mode_enabled = retract_mode_enabled;
+
         if (!calculate_predicted_duration()) {
             MotionModeManager::forceIdle("Failed to build extrusion planner");
             show_missing_param_dialog("Failed to build extrusion planner");
             return;
         }
 
-        show_start_confirm_dialog(btn);
+        // 確認視窗打開後，不允許再改回抽模式
+        set_retract_switch_enabled(false);
+
+        show_start_confirm_dialog(btn);  
     }
     else {
         show_confirm_dialog(btn, tab1);
@@ -249,7 +329,7 @@ static void start_btn_event_cb(lv_event_t* e)
 void create_start_button(lv_obj_t* parent, lv_coord_t x, lv_coord_t y)
 {
     start_btn = lv_btn_create(parent);
-    lv_obj_set_size(start_btn, 320, 60);
+    lv_obj_set_size(start_btn, 250, 60);
     lv_obj_align(start_btn, LV_ALIGN_BOTTOM_MID, x, y);
     lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x0000FF), 0);
 
@@ -259,6 +339,74 @@ void create_start_button(lv_obj_t* parent, lv_coord_t x, lv_coord_t y)
     lv_label_set_text(label, "START");
     lv_obj_set_style_text_font(label, &montserrat_30, 0);
     lv_obj_center(label);
+}
+
+static void update_retract_switch_label()
+{
+    if (!retract_switch_label) return;
+
+    lv_label_set_text(
+        retract_switch_label,
+        retract_mode_enabled ? "Retraction: ON" : "Retraction: OFF"
+    );
+}
+
+static void retract_switch_event_cb(lv_event_t* e)
+{
+    lv_obj_t* sw = lv_event_get_target(e);
+
+    retract_mode_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    update_retract_switch_label();
+}
+
+static void create_retract_mode_switch(lv_obj_t* parent)
+{
+    retract_switch_label = lv_label_create(parent);
+    lv_label_set_text(retract_switch_label, "Retraction: OFF");
+    lv_obj_set_style_text_font(retract_switch_label, &montserrat_20, 0);
+
+    // 放在 User Manual 按鈕左邊
+    lv_obj_align(
+        retract_switch_label,
+        LV_ALIGN_BOTTOM_LEFT,
+        10,
+        -60
+    );
+
+    retract_switch = lv_switch_create(parent);
+    lv_obj_set_size(retract_switch, 90, 45);
+
+    // User Manual 按鈕目前在右下角，所以 switch 往左放
+    lv_obj_align(
+        retract_switch,
+        LV_ALIGN_BOTTOM_LEFT,
+        10,
+        -10
+    );
+
+    // 不要求和附圖一致，只做明顯 ON/OFF 顏色
+    lv_obj_set_style_bg_color(
+        retract_switch,
+        lv_palette_main(LV_PALETTE_BLUE),
+        LV_PART_INDICATOR | LV_STATE_CHECKED
+    );
+
+    // disabled 時反灰
+    lv_obj_set_style_opa(
+        retract_switch,
+        LV_OPA_50,
+        LV_STATE_DISABLED
+    );
+
+    lv_obj_add_event_cb(
+        retract_switch,
+        retract_switch_event_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL
+    );
+
+    update_retract_switch_label();
 }
 
 void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
@@ -310,12 +458,49 @@ void show_confirm_dialog(lv_obj_t* btn, lv_obj_t* parent)
         if (!tr.success) {
             MotionModeManager::forceIdle("User stop requested");
         }
+        
+        MotorControlScreen::forceDisableMotor();
 
-        MotorControlScreen::stopMotion();
-
-        stop_requested = true;
+        stop_requested = false;
         stop_requested_by_timeout = false;
-        stop_request_ms = millis();
+        stop_request_ms = 0;
+
+        is_running = false;
+        current_tail_recording = false;
+        current_tail_start_ms = 0;
+        chart_total_duration_sec = 0.0f;
+        run_phase = RUN_PHASE_IDLE;
+        phase_start_ms = 0;
+
+        MotionModeManager::forceIdle("User stopped and motor disabled");
+
+        recorded_duration_valid = false;
+        realtime_motion_planner_valid = false;
+        tmc_executable_planner_valid = false;
+        g_tmc_ramp_cmd = TmcRampCommand();
+
+        set_tab3_control_buttons_enabled(true);
+        set_retract_switch_enabled(true);
+        retract_move_started = false;
+
+        if (RealtimeCurveRenderer::isInitialized()) {
+            RealtimeCurveRenderer::releaseTempData();
+        }
+
+        if (start_btn) {
+            lv_obj_t* label = lv_obj_get_child(start_btn, 0);
+            lv_label_set_text(label, "START");
+            lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x0000FF), 0);
+        }
+
+        clear_countdown_dialog();
+
+        if (confirm_dialog) {
+            lv_obj_del(confirm_dialog);
+            confirm_dialog = NULL;
+        }
+
+        show_finish_dialog();
 
         if (confirm_dialog) {
             lv_obj_del(confirm_dialog);
@@ -354,6 +539,208 @@ bool fetch_setting_values()
     return (recorded_viscosity && recorded_quantity);
 }
 
+static float apply_duration_calibration(float raw_duration_s, float calibration)
+{
+    if (raw_duration_s <= 0.0f) {
+        return 0.0f;
+    }
+
+    return raw_duration_s * calibration;
+}
+
+static float calc_display_margin_s(float base_duration_s)
+{
+    if (base_duration_s <= 0.0f) {
+        return DISPLAY_MARGIN_MIN_SEC;
+    }
+
+    float margin = base_duration_s * DISPLAY_MARGIN_RATIO;
+
+    if (margin < DISPLAY_MARGIN_MIN_SEC) {
+        margin = DISPLAY_MARGIN_MIN_SEC;
+    }
+
+    return margin;
+}
+
+static float calc_timeout_margin_s(float base_duration_s)
+{
+    if (base_duration_s <= 0.0f) {
+        return TIMEOUT_MARGIN_MIN_SEC;
+    }
+
+    float margin = base_duration_s * TIMEOUT_MARGIN_RATIO;
+
+    if (margin < TIMEOUT_MARGIN_MIN_SEC) {
+        margin = TIMEOUT_MARGIN_MIN_SEC;
+    }
+
+    return margin;
+}
+
+static float calc_extrusion_timeout_margin_s(float base_duration_s)
+{
+    float margin = calc_timeout_margin_s(base_duration_s);
+
+    if (run_retract_mode_enabled) {
+        float retract_safe_margin =
+            base_duration_s * RETRACTION_EXTRUSION_TIMEOUT_RATIO;
+
+        if (retract_safe_margin < RETRACTION_EXTRUSION_TIMEOUT_MIN_SEC) {
+            retract_safe_margin = RETRACTION_EXTRUSION_TIMEOUT_MIN_SEC;
+        }
+
+        if (retract_safe_margin > margin) {
+            margin = retract_safe_margin;
+        }
+    }
+
+    return margin;
+}
+
+static void format_seconds_2dp(char* buf, size_t buf_size, float seconds)
+{
+    if (!buf || buf_size == 0) return;
+
+    if (seconds < 0.0f) {
+        seconds = 0.0f;
+    }
+
+    unsigned long ms =
+        (unsigned long)(seconds * 1000.0f + 0.5f);
+
+    unsigned long sec_int  = ms / 1000;
+    unsigned long sec_frac = (ms % 1000) / 10;
+
+    snprintf(buf, buf_size, "%lu.%02lu", sec_int, sec_frac);
+}
+
+static float calc_system_progress_percent_f()
+{
+    unsigned long elapsed_ms = millis() - run_start_ms;
+
+    float progress_total_sec = operation_motion_duration_sec_exact;
+
+    if (progress_total_sec <= 0.0f) {
+        progress_total_sec = recorded_duration_sec_exact;
+    }
+
+    if (progress_total_sec <= 0.0f) {
+        progress_total_sec = 1.0f;
+    }
+
+    float percent_f =
+        ((elapsed_ms / 1000.0f) * 100.0f) / progress_total_sec;
+
+    if (percent_f < 0.0f) {
+        percent_f = 0.0f;
+    }
+
+    if (percent_f > 99.9f) {
+        percent_f = 99.9f;
+    }
+
+    return percent_f;
+}
+
+static void set_system_progress_percent(float percent_f, bool allow_100)
+{
+    if (percent_f < 0.0f) {
+        percent_f = 0.0f;
+    }
+
+    if (allow_100) {
+        if (percent_f > 100.0f) {
+            percent_f = 100.0f;
+        }
+    }
+    else {
+        if (percent_f > 99.9f) {
+            percent_f = 99.9f;
+        }
+    }
+
+    if (arc_progress) {
+        int arc_percent = allow_100
+            ? (int)(percent_f + 0.5f)
+            : (int)(percent_f);
+
+        lv_arc_set_value(arc_progress, arc_percent);
+    }
+
+    if (lbl_percent) {
+        int percent_x10 = (int)(percent_f * 10.0f + 0.5f);
+
+        if (allow_100 && percent_x10 > 1000) {
+            percent_x10 = 1000;
+        }
+
+        if (!allow_100 && percent_x10 > 999) {
+            percent_x10 = 999;
+        }
+
+        lv_label_set_text_fmt(
+            lbl_percent,
+            "%d.%d%%",
+            percent_x10 / 10,
+            percent_x10 % 10
+        );
+    }
+}
+
+static void begin_system_progress_tail_ramp()
+{
+    system_progress_force_remaining_zero = true;
+    system_progress_force_complete = false;
+
+    system_progress_tail_ramp_active = true;
+    system_progress_tail_start_ms = millis();
+    system_progress_tail_start_percent = calc_system_progress_percent_f();
+
+    if (system_progress_tail_start_percent > 99.9f) {
+        system_progress_tail_start_percent = 99.9f;
+    }
+
+    if (lbl_remaining) {
+        lv_label_set_text(
+            lbl_remaining,
+            "Remaining Time (s): \n0.00"
+        );
+    }
+}
+
+static void force_system_progress_operation_complete()
+{
+    system_progress_force_remaining_zero = true;
+    system_progress_force_complete = true;
+
+    system_progress_tail_ramp_active = false;
+    system_progress_tail_start_percent = 0.0f;
+    system_progress_tail_start_ms = 0;
+
+    if (lbl_remaining) {
+        lv_label_set_text(
+            lbl_remaining,
+            "Remaining Time (s): \n0.00"
+        );
+    }
+
+    set_system_progress_percent(100.0f, true);
+
+    if (lbl_percent && arc_progress) {
+        lv_obj_align_to(
+            lbl_percent,
+            arc_progress,
+            LV_ALIGN_CENTER,
+            0,
+            0
+        );
+    }
+}
+
+static TmcRampCommand make_retract_command_4mm();
+static bool start_retract_move_4mm();
+
 void show_start_confirm_dialog(lv_obj_t* start_btn)
 {
     if (confirm_dialog) return;
@@ -375,29 +762,64 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
     lv_obj_t* info = lv_label_create(confirm_dialog);
 
     char info_buf[256];
-
+    //
     if (recorded_duration_valid) {
-        unsigned long duration_ms   = (unsigned long)(recorded_duration_sec_exact * 1000.0f + 0.5f);
-        unsigned long duration_int  = duration_ms / 1000;
-        unsigned long duration_frac = (duration_ms % 1000) / 10; // 2 digits
+        char duration_buf[32];
+        char retract_buf[32];
+        char backdraw_buf[64];
+
+        format_seconds_2dp(
+            duration_buf,
+            sizeof(duration_buf),
+            display_duration_sec_exact
+        );
+
+        if (run_retract_mode_enabled && retraction_duration_sec_exact > 0.0f)  {
+            format_seconds_2dp(
+                retract_buf,
+                sizeof(retract_buf),
+                retraction_duration_sec_exact
+            );
+
+            snprintf(
+                backdraw_buf,
+                sizeof(backdraw_buf),
+                "ON (+%s s)",
+                retract_buf
+            );
+        }
+        else {
+            snprintf(
+                backdraw_buf,
+                sizeof(backdraw_buf),
+                "OFF"
+            );
+        }
 
         snprintf(
             info_buf,
             sizeof(info_buf),
-            "Liquid Viscosity: %s\nExtrusion Quantity: %s\nDuration: %lu.%02lu s",
+            "Liquid Viscosity: %s\n"
+            "Extrusion Quantity: %s\n"
+            "Duration: %s s\n"
+            "Backdraw: %s",
             recorded_viscosity,
             recorded_quantity,
-            duration_int,
-            duration_frac
+            duration_buf,
+            backdraw_buf
         );
     }
     else {
         snprintf(
             info_buf,
             sizeof(info_buf),
-            "Liquid Viscosity: %s\nExtrusion Quantity: %s\nDuration: N/A",
+            "Liquid Viscosity: %s\n"
+            "Extrusion Quantity: %s\n"
+            "Duration: N/A\n"
+            "Backdraw: %s",
             recorded_viscosity,
-            recorded_quantity
+            recorded_quantity,
+            run_retract_mode_enabled ? "ON" : "OFF"
         );
     }
 
@@ -435,6 +857,7 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         if (!tmc_executable_planner_valid || !g_tmc_ramp_cmd.valid)
         {
             MotionModeManager::forceIdle("Invalid TMC ramp command");
+            set_retract_switch_enabled(true);
 
             lv_obj_del(confirm_dialog);
             confirm_dialog = NULL;
@@ -447,6 +870,7 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         if (!MotorControlScreen::startExtrusionMove(g_tmc_ramp_cmd))
         {
             MotionModeManager::forceIdle("Extrusion start failed");
+            set_retract_switch_enabled(true);
 
             lv_obj_del(confirm_dialog);
             confirm_dialog = NULL;
@@ -459,14 +883,44 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         stop_requested = false;
         stop_requested_by_timeout = false;
 
+        // 使用 START 時已鎖定的回抽模式
+        retract_move_started = false;
+
         is_running = true;
         run_start_ms = millis();
+        phase_start_ms = run_start_ms;
+        run_phase = RUN_PHASE_EXTRUDING;
+
+        system_progress_force_remaining_zero = false;
+        system_progress_force_complete = false;
+        system_progress_tail_ramp_active = false;
+        system_progress_tail_start_percent = 0.0f;
+        system_progress_tail_start_ms = 0;
+
+        // Reset TMC distance monitor for the new extrusion run.
+        tmc_distance_frozen_after_extrusion = false;
+        last_tmc_target_distance_mm = 0.0f;
+        last_tmc_actual_distance_mm = 0.0f;
+
         last_curve_update_ms = 0;
+
         set_tab3_control_buttons_enabled(false);
+        set_retract_switch_enabled(false);
 
         // reset charts using executable motion range
         RealtimeCurveRenderer::Config curve_cfg;
-        curve_cfg.expected_duration_s = recorded_duration_sec_exact;
+        current_tail_recording = false;
+        current_tail_start_ms = 0;
+
+        chart_total_duration_sec =
+            operation_motion_duration_sec_exact + CURRENT_TAIL_SEC;
+
+        if (chart_total_duration_sec <= 0.0f) {
+            chart_total_duration_sec =
+                recorded_duration_sec_exact + CURRENT_TAIL_SEC;
+        }
+
+        curve_cfg.expected_duration_s = chart_total_duration_sec;
         curve_cfg.sample_interval_ms  = 100;   // one point every 100 ms
         curve_cfg.point_count         = 0;      // auto-calc
         curve_cfg.volume_max_uL       = realtime_curve_volume_max_uL * 1.1f; // chart Y axis range
@@ -482,7 +936,7 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         RealtimeCurveRenderer::reset(curve_cfg);
 
         update_system_progress_data();
-        show_countdown_dialog(recorded_duration_sec, tab1);
+        show_countdown_dialog(display_duration_sec_exact, tab1);
 
         // ✅ 強制第一點
         if (tmc_executable_planner_valid && RealtimeCurveRenderer::isInitialized()) {
@@ -512,6 +966,8 @@ void show_start_confirm_dialog(lv_obj_t* start_btn)
         g_tmc_ramp_cmd = TmcRampCommand();
 
         recorded_duration_valid = false;
+
+        set_retract_switch_enabled(true);
 
         lv_obj_del(confirm_dialog);
         confirm_dialog = NULL;
@@ -549,7 +1005,7 @@ void show_missing_param_dialog(const char* msg)
     }, LV_EVENT_CLICKED, NULL);
 }
 
-void show_countdown_dialog(int duration_sec, lv_obj_t* parent)
+void show_countdown_dialog(float duration_sec, lv_obj_t* parent)
 {
     if (countdown_dialog) return;
 
@@ -573,7 +1029,10 @@ void show_countdown_dialog(int duration_sec, lv_obj_t* parent)
 
     // countdown value
     countdown_label = lv_label_create(countdown_dialog);
-    lv_label_set_text_fmt(countdown_label, "%d s", duration_sec);
+    char duration_buf[32];
+    format_seconds_2dp(duration_buf, sizeof(duration_buf), duration_sec);
+
+    lv_label_set_text_fmt(countdown_label, "%s s", duration_buf);
     lv_obj_set_style_text_font(countdown_label, &montserrat_48, 0);
     lv_obj_align(countdown_label, LV_ALIGN_CENTER, 0, 20);
 
@@ -912,10 +1371,10 @@ void create_system_progress_ui(lv_obj_t* parent)
     /* 禁止互動 */
     lv_obj_clear_flag(arc_progress, LV_OBJ_FLAG_CLICKABLE);
     //lv_obj_remove_style(arc_progress, NULL, LV_PART_KNOB); // 不要旋鈕
-    lv_obj_align(arc_progress, LV_ALIGN_LEFT_MID, 40, 0);
+    lv_obj_align(arc_progress, LV_ALIGN_LEFT_MID, 10, 0);
 
     lbl_percent = lv_label_create(parent);
-    lv_label_set_text(lbl_percent, "0%");
+    lv_label_set_text(lbl_percent, "0.0%");
     lv_obj_set_style_text_font(lbl_percent, &montserrat_48, 0);
     lv_obj_align_to(lbl_percent, arc_progress, LV_ALIGN_CENTER, 5, 0);
 
@@ -926,8 +1385,8 @@ void create_system_progress_ui(lv_obj_t* parent)
     // lv_obj_align_to(syringe, arc_progress, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 
     /* ===== Info Text ===== */
-    lv_coord_t x =330;
-    lv_coord_t y = 50;
+    lv_coord_t x =300;
+    lv_coord_t y = 10;
 
     lbl_remaining = lv_label_create(parent);
     lv_label_set_text(lbl_remaining, "Remaining Time (s): ");
@@ -955,6 +1414,17 @@ void create_system_progress_ui(lv_obj_t* parent)
     lv_label_set_text(lbl_elapsed, "Elapsed Time (s): ");
     lv_obj_set_style_text_font(lbl_elapsed, &montserrat_26, 0);
     lv_obj_align_to(lbl_elapsed, lbl_duration, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 15);
+
+    lbl_tmc_target_distance = lv_label_create(parent);
+    lv_label_set_text(lbl_tmc_target_distance, "Target Distance (mm): 0.00");
+    lv_obj_set_style_text_font(lbl_tmc_target_distance, &montserrat_26, 0);
+    lv_obj_align_to(lbl_tmc_target_distance, lbl_elapsed, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 15);
+
+    lbl_tmc_actual_distance = lv_label_create(parent);
+    lv_label_set_text(lbl_tmc_actual_distance, "Actual Distance (mm): 0.00");
+    lv_obj_set_style_text_font(lbl_tmc_actual_distance, &montserrat_26, 0);
+    lv_obj_align_to(lbl_tmc_actual_distance, lbl_tmc_target_distance, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 15);
+
 }
 
 void create_tab3_curve_preview_blocks(lv_obj_t* parent)
@@ -1162,7 +1632,7 @@ static void build_manual_screen_tab3()
 
     // Title
     lv_obj_t* title = lv_label_create(manual_screen_tab3);
-    lv_label_set_text(title, "User Manual for DEVELPOER INFO");
+    lv_label_set_text(title, "User Manual for DEVELOPER INFO");
     lv_obj_set_style_text_font(title, &montserrat_40, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -1268,6 +1738,15 @@ static void nav_button_event_cb(lv_event_t* e)
     }
 }
 
+static void apply_alpha_icon_style(lv_obj_t* img, lv_color_t color)
+{
+    if (!img) return;
+
+    lv_obj_set_style_img_recolor(img, color, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_img_opa(img, LV_OPA_COVER, LV_PART_MAIN);
+}
+
 static lv_obj_t* create_nav_button(
     lv_obj_t* parent,
     lv_coord_t btn_w,
@@ -1287,9 +1766,13 @@ static lv_obj_t* create_nav_button(
 
     lv_obj_t* img = lv_img_create(btn);
     lv_img_set_src(img, img_src);
+    const lv_img_dsc_t* dsc = (const lv_img_dsc_t*)img_src;
+    lv_img_set_pivot(img, dsc->header.w / 2, dsc->header.h / 2);
     lv_img_set_zoom(img, img_zoom);
-    lv_obj_center(img);
 
+    apply_alpha_icon_style(img, lv_color_black());
+
+    lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
 
     // 不再 malloc，改用靜態 pool
@@ -1308,14 +1791,70 @@ static lv_obj_t* create_nav_button(
     return btn;
 }
 
+static void disable_motor_button_event_cb(lv_event_t* e)
+{
+    LV_UNUSED(e);
+
+    if (is_running || stop_requested) {
+        show_missing_param_dialog("Cannot disable motor while running");
+        return;
+    }
+
+    MotorControlScreen::disableMotor();
+}
+
+static lv_obj_t* create_disable_motor_button(
+    lv_obj_t* parent,
+    lv_coord_t btn_w,
+    lv_coord_t btn_h,
+    lv_align_t align,
+    lv_coord_t x_ofs,
+    lv_coord_t y_ofs,
+    const void* img_src,
+    uint16_t img_zoom
+)
+{
+    lv_obj_t* btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, btn_w, btn_h);
+    lv_obj_align(btn, align, x_ofs, y_ofs);
+
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x80C000), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
+
+    lv_obj_t* img = lv_img_create(btn);
+    lv_img_set_src(img, img_src);
+    const lv_img_dsc_t* dsc = (const lv_img_dsc_t*)img_src;
+    lv_img_set_pivot(img, dsc->header.w / 2, dsc->header.h / 2);
+    lv_img_set_zoom(img, img_zoom);
+
+    apply_alpha_icon_style(img, lv_color_black());
+
+    lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_add_event_cb(
+        btn,
+        disable_motor_button_event_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    return btn;
+}
+
 static void set_tab3_control_buttons_enabled(bool enabled)
 {
-    lv_obj_t* buttons[2] = {
+    lv_obj_t* buttons[] = {
         btn_tab3_parameter_setting,
-        btn_tab3_motor_control
+        btn_tab3_motor_control,
+        btn_tab3_disable_motor
     };
 
-    for (int i = 0; i < 2; i++) {
+    // sizeof(buttons) 取得是bytes of array not number of elements
+    const int button_count = sizeof(buttons) / sizeof(buttons[0]);
+
+    for (int i = 0; i < button_count; i++) {
         lv_obj_t* btn = buttons[i];
         if (!btn) continue;
 
@@ -1327,9 +1866,10 @@ static void set_tab3_control_buttons_enabled(bool enabled)
             lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
             lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
 
-            lv_obj_t* img = lv_obj_get_child(btn, 0);
-            if (img) {
-                lv_obj_set_style_img_opa(img, LV_OPA_COVER, 0);
+            lv_obj_t* child = lv_obj_get_child(btn, 0);
+            if (child) {
+                lv_obj_set_style_img_opa(child, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_opa(child, LV_OPA_COVER, 0);
             }
         }
         else {
@@ -1340,26 +1880,186 @@ static void set_tab3_control_buttons_enabled(bool enabled)
             lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
             lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
 
-            lv_obj_t* img = lv_obj_get_child(btn, 0);
-            if (img) {
-                lv_obj_set_style_img_opa(img, LV_OPA_50, 0);
+            lv_obj_t* child = lv_obj_get_child(btn, 0);
+            if (child) {
+                lv_obj_set_style_img_opa(child, LV_OPA_50, 0);
+                lv_obj_set_style_text_opa(child, LV_OPA_50, 0);
             }
         }
     }
 }
 
+static void set_retract_switch_enabled(bool enabled)
+{
+    if (!retract_switch) return;
+
+    if (enabled) {
+        lv_obj_clear_state(retract_switch, LV_STATE_DISABLED);
+        lv_obj_add_flag(retract_switch, LV_OBJ_FLAG_CLICKABLE);
+
+        if (retract_switch_label) {
+            lv_obj_set_style_opa(retract_switch_label, LV_OPA_COVER, 0);
+        }
+    }
+    else {
+        lv_obj_add_state(retract_switch, LV_STATE_DISABLED);
+        lv_obj_clear_flag(retract_switch, LV_OBJ_FLAG_CLICKABLE);
+
+        if (retract_switch_label) {
+            lv_obj_set_style_opa(retract_switch_label, LV_OPA_50, 0);
+        }
+    }
+}
+
+
+// LVGL not support %f, have to use %ld.%02ld
+static void format_mm_2dp(char* buf, size_t buf_size, float value_mm)
+{
+    if (!buf || buf_size == 0) return;
+
+    bool negative = false;
+
+    if (value_mm < 0.0f) {
+        negative = true;
+        value_mm = -value_mm;
+    }
+
+    unsigned long scaled =
+        (unsigned long)(value_mm * 100.0f + 0.5f);
+
+    unsigned long int_part = scaled / 100;
+    unsigned long frac_part = scaled % 100;
+
+    if (negative) {
+        snprintf(
+            buf,
+            buf_size,
+            "-%lu.%02lu",
+            int_part,
+            frac_part
+        );
+    }
+    else {
+        snprintf(
+            buf,
+            buf_size,
+            "%lu.%02lu",
+            int_part,
+            frac_part
+        );
+    }
+}
+
+static void render_tmc_distance_labels()
+{
+    char target_buf[24];
+    char actual_buf[24];
+
+    format_mm_2dp(
+        target_buf,
+        sizeof(target_buf),
+        last_tmc_target_distance_mm
+    );
+
+    format_mm_2dp(
+        actual_buf,
+        sizeof(actual_buf),
+        last_tmc_actual_distance_mm
+    );
+
+    if (lbl_tmc_target_distance) {
+        char line_buf[80];
+
+        snprintf(
+            line_buf,
+            sizeof(line_buf),
+            "Target Distance (mm): %s",
+            target_buf
+        );
+
+        lv_label_set_text(
+            lbl_tmc_target_distance,
+            line_buf
+        );
+    }
+
+    if (lbl_tmc_actual_distance) {
+        char line_buf[80];
+
+        snprintf(
+            line_buf,
+            sizeof(line_buf),
+            "Actual Distance (mm): %s",
+            actual_buf
+        );
+
+        lv_label_set_text(
+            lbl_tmc_actual_distance,
+            line_buf
+        );
+    }
+}
+
+static void update_tmc_distance_labels()
+{
+    // During extrusion, keep reading live TMC values.
+    // After extrusion has finished, keep the cached extrusion-end values.
+    if (!tmc_distance_frozen_after_extrusion &&
+        MotorControlScreen::isReady()) {
+
+        last_tmc_target_distance_mm =
+            MotorControlScreen::getTargetDistanceMm();
+
+        last_tmc_actual_distance_mm =
+            MotorControlScreen::getActualDistanceMm();
+    }
+
+    render_tmc_distance_labels();
+}
+
+static void freeze_tmc_distance_at_extrusion_end()
+{
+    // Capture extrusion-end values before retraction starts.
+    // This is important because start_retract_move_4mm() will issue a new TMC target.
+    if (MotorControlScreen::isReady()) {
+        last_tmc_target_distance_mm =
+            MotorControlScreen::getTargetDistanceMm();
+
+        last_tmc_actual_distance_mm =
+            MotorControlScreen::getActualDistanceMm();
+    }
+
+    tmc_distance_frozen_after_extrusion = true;
+
+    render_tmc_distance_labels();
+}
+
 void update_system_progress_data()
 {
+    // TMC distance belongs to MotorControlScreen state.
+    // Update it even when the main extrusion run flag is not active.
+    update_tmc_distance_labels();
+
     if (!is_running) return;
 
     unsigned long elapsed_ms = millis() - run_start_ms;
 
-    float total_sec = recorded_duration_sec_exact;
-    float elapsed_sec_f = elapsed_ms / 1000.0f;
+    float total_sec =
+        (display_duration_sec_exact > 0.0f)
+        ? display_duration_sec_exact
+        : recorded_duration_sec_exact;
 
+    float elapsed_sec_f = elapsed_ms / 1000.0f;
+    
     float remaining_sec_f = total_sec - elapsed_sec_f;
-    if (remaining_sec_f < 0.0f)
+
+    if (remaining_sec_f < 0.0f) {
         remaining_sec_f = 0.0f;
+    }
+
+    if (system_progress_force_remaining_zero) {
+        remaining_sec_f = 0.0f;
+    }
 
     /* ===== 同步真實資料 ===== */
 
@@ -1382,41 +2082,34 @@ void update_system_progress_data()
     }
 
     // Duration（真實 duration）
-    unsigned long total_ms =
-        (unsigned long)(recorded_duration_sec_exact * 1000.0f + 0.5f);
-
-    unsigned long dur_int  = total_ms / 1000;
-    unsigned long dur_frac = (total_ms % 1000) / 10;
+    char duration_buf[32];
+    format_seconds_2dp(duration_buf, sizeof(duration_buf), total_sec);
 
     lv_label_set_text_fmt(
         lbl_duration,
-        "Duration (s): %lu.%02lu",
-        dur_int,
-        dur_frac
+        "Duration (s): %s",
+        duration_buf
     );
 
     // Remaining time
     // 轉成 xx.xx
-    unsigned long remaining_ms = (unsigned long)(remaining_sec_f * 1000.0f + 0.5f);
-    unsigned long sec_int = remaining_ms / 1000;
-    unsigned long sec_frac = (remaining_ms % 1000) / 10;
+    char remaining_buf[32];
+    format_seconds_2dp(remaining_buf, sizeof(remaining_buf), remaining_sec_f);
 
     lv_label_set_text_fmt(
         lbl_remaining,
-        "Remaining Time (s): \n%lu.%02lu",
-        sec_int,
-        sec_frac
+        "Remaining Time (s): \n%s",
+        remaining_buf
     );
 
     // Elapsed time
-    unsigned long elapsed_int  = elapsed_ms / 1000;
-    unsigned long elapsed_frac = (elapsed_ms % 1000) / 10;
+    char elapsed_buf[32];
+    format_seconds_2dp(elapsed_buf, sizeof(elapsed_buf), elapsed_sec_f);
 
     lv_label_set_text_fmt(
         lbl_elapsed,
-        "Elapsed Time (s): %lu.%02lu",
-        elapsed_int,
-        elapsed_frac
+        "Elapsed Time (s): %s",
+        elapsed_buf
     );
 }
 // --------------------------------------
@@ -1465,8 +2158,16 @@ static void destroy_manual_screen_tab3_async(void* user_data)
 static bool calculate_predicted_duration()
 {
     recorded_duration_valid = false;
+
     recorded_duration_sec_exact = 0.0f;
     recorded_duration_sec = 0;
+
+    extrusion_duration_sec_exact = 0.0f;
+    retraction_duration_sec_exact = 0.0f;
+    operation_motion_duration_sec_exact = 0.0f;
+
+    display_duration_sec_exact = 0.0f;
+    display_duration_sec = 0;
 
     if (!build_realtime_motion_planner_from_current_settings()) {
         return false;
@@ -1476,16 +2177,60 @@ static bool calculate_predicted_duration()
         return false;
     }
 
-    // Use the TMC-executable duration, not the ideal planner duration.
-    recorded_duration_sec_exact = g_tmc_ramp_cmd.expected_duration_s;
+    float raw_extrusion_duration_s =
+        MotorControlScreen::estimateExecutableDurationS(g_tmc_ramp_cmd);
 
-    if (recorded_duration_sec_exact <= 0.0f) {
+    if (raw_extrusion_duration_s <= 0.0f) {
         return false;
     }
 
-    recorded_duration_sec = (int)(recorded_duration_sec_exact + 0.5f);
+    extrusion_duration_sec_exact =
+        apply_duration_calibration(
+            raw_extrusion_duration_s,
+            EXTRUSION_DURATION_CALIBRATION
+        );
+
+    g_tmc_ramp_cmd.expected_duration_s = extrusion_duration_sec_exact;
+
+    // recorded_duration_sec_exact 保留為主擠出時間
+    recorded_duration_sec_exact = extrusion_duration_sec_exact;
+
+    if (run_retract_mode_enabled) {
+        TmcRampCommand retract_cmd = make_retract_command_4mm();
+
+        if (!retract_cmd.valid) {
+            return false;
+        }
+
+        retraction_duration_sec_exact = retract_cmd.expected_duration_s;
+    }
+
+    operation_motion_duration_sec_exact =
+        extrusion_duration_sec_exact + retraction_duration_sec_exact;
+
+    if (operation_motion_duration_sec_exact <= 0.0f) {
+        return false;
+    }
+
+    float display_margin_s =
+        calc_display_margin_s(operation_motion_duration_sec_exact);
+
+    // UI 顯示與 countdown 使用同一個值
+    display_duration_sec_exact =
+        operation_motion_duration_sec_exact + display_margin_s;
+
+    recorded_duration_sec =
+        (int)(recorded_duration_sec_exact + 0.5f);
+
+    display_duration_sec =
+        (int)(display_duration_sec_exact + 0.999f);
+
     if (recorded_duration_sec < 1) {
         recorded_duration_sec = 1;
+    }
+
+    if (display_duration_sec < 1) {
+        display_duration_sec = 1;
     }
 
     recorded_duration_valid = true;
@@ -1783,16 +2528,16 @@ static bool build_realtime_motion_planner_from_current_settings()
     // They are intentionally not exposed to normal syringe users.
 
     // ====== For Planner Value Monitor =====
-    #if DEBUG_PLANNER
-    print_flow_params(flow_params);
-    #endif
+    // #if DEBUG_PLANNER
+    // print_flow_params(flow_params);
+    // #endif
     // ======================================
 
     FlowConstraintModel::Result flow_result = FlowConstraintModel::compute(flow_params);
     // ====== For Planner Value Monitor =====
-    #if DEBUG_PLANNER
-    print_flow_result(flow_result);
-    #endif
+    // #if DEBUG_PLANNER
+    // print_flow_result(flow_result);
+    // #endif
     // ======================================
 
     if (!flow_result.valid || flow_result.Q_allow <= 0.0f) {
@@ -1811,9 +2556,9 @@ static bool build_realtime_motion_planner_from_current_settings()
     realtime_motion_planner_valid = true;
 
     // ====== For Planner Value Monitor =====
-    #if DEBUG_PLANNER
-    print_ideal_planner(realtime_motion_planner);
-    #endif
+    // #if DEBUG_PLANNER
+    // print_ideal_planner(realtime_motion_planner);
+    // #endif
     // ======================================
 
     // // ------------------------------------------------------------
@@ -1868,14 +2613,14 @@ static bool build_realtime_motion_planner_from_current_settings()
 
     // Position mode should not use VSTOP = 0.
     // Must be smaller than 0.007 mm/s.
-    tmc_cfg.stop_velocity_mm_s = 0.001f;
+    tmc_cfg.stop_velocity_mm_s = 0.0022f;
 
     // Keep first velocity zero if this was already verified.
-    tmc_cfg.first_velocity_ratio = 0.0f;
+    tmc_cfg.first_velocity_ratio = 0.50f;
 
     // But keep first acceleration/deceleration nonzero.
-    tmc_cfg.first_acceleration_ratio = 0.50f;
-    tmc_cfg.first_deceleration_ratio = 0.50f;
+    tmc_cfg.first_acceleration_ratio = 0.40f;
+    tmc_cfg.first_deceleration_ratio = 0.40f;
 
     tmc_cfg.velocity_safety_scale = 1.0f;
     tmc_cfg.reverse_direction = false;
@@ -1896,9 +2641,9 @@ static bool build_realtime_motion_planner_from_current_settings()
     tmc_executable_planner_valid = g_tmc_ramp_cmd.valid;
 
     // ====== For Planner Value Monitor =====
-    #if DEBUG_PLANNER
-    print_tmc_command(g_tmc_ramp_cmd);
-    #endif
+    // #if DEBUG_PLANNER
+    // print_tmc_command(g_tmc_ramp_cmd);
+    // #endif
     // ======================================
 
     // //////////
@@ -1980,6 +2725,81 @@ static bool build_realtime_motion_planner_from_current_settings()
     return true;
 }
 
+static TmcRampCommand make_retract_command_4mm()
+{
+    TmcRampCommand retract_cmd;
+
+    if (!g_tmc_ramp_cmd.valid) {
+        return retract_cmd;
+    }
+
+    retract_cmd = g_tmc_ramp_cmd;
+
+    retract_cmd.valid = true;
+    retract_cmd.target_distance_mm = RETRACT_DISTANCE_MM;
+    retract_cmd.quantity_uL = 0.0f;
+
+    // 回抽方向 = 主擠出相反
+    retract_cmd.reverse_direction = !g_tmc_ramp_cmd.reverse_direction;
+
+    // 保留你設定的回抽速度，不為了估算去改速度
+    retract_cmd.max_velocity_mm_s = RETRACT_MAX_VELOCITY_MM_S;
+    retract_cmd.max_acceleration_mm_s2 = RETRACT_ACCEL_MM_S2;
+    retract_cmd.max_deceleration_mm_s2 = RETRACT_DECEL_MM_S2;
+
+    retract_cmd.start_velocity_mm_s = 0.0f;
+    retract_cmd.stop_velocity_mm_s = 0.0022f;
+
+    retract_cmd.first_velocity_mm_s = 0.0f;
+    retract_cmd.first_acceleration_mm_s2 = RETRACT_ACCEL_MM_S2 * 0.4f;
+    retract_cmd.first_deceleration_mm_s2 = RETRACT_DECEL_MM_S2 * 0.4f;
+
+    float raw_duration_s =
+        MotorControlScreen::estimateExecutableDurationS(retract_cmd);
+
+    if (raw_duration_s <= 0.0f) {
+        retract_cmd.valid = false;
+        return retract_cmd;
+    }
+
+    retract_cmd.expected_duration_s =
+        apply_duration_calibration(
+            raw_duration_s,
+            RETRACTION_DURATION_CALIBRATION
+        );
+
+    return retract_cmd;
+}
+
+static bool start_retract_move_4mm()
+{
+    TmcRampCommand retract_cmd = make_retract_command_4mm();
+
+    if (!retract_cmd.valid) {
+        return false;
+    }
+
+    retraction_duration_sec_exact =
+        retract_cmd.expected_duration_s;
+
+    Serial.println("========== RETRACTION COMMAND ==========");
+    Serial.print("target_distance_mm = ");
+    Serial.println(retract_cmd.target_distance_mm, 6);
+    Serial.print("max_velocity_mm_s = ");
+    Serial.println(retract_cmd.max_velocity_mm_s, 6);
+    Serial.print("max_acceleration_mm_s2 = ");
+    Serial.println(retract_cmd.max_acceleration_mm_s2, 6);
+    Serial.print("max_deceleration_mm_s2 = ");
+    Serial.println(retract_cmd.max_deceleration_mm_s2, 6);
+    Serial.print("expected_duration_s = ");
+    Serial.println(retract_cmd.expected_duration_s, 6);
+    Serial.print("reverse_direction = ");
+    Serial.println(retract_cmd.reverse_direction ? "true" : "false");
+    Serial.println("========================================");
+
+    return MotorControlScreen::startExtrusionMove(retract_cmd);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -2004,6 +2824,7 @@ void setup() {
 
   quantity_block = lv_create_input_block(tab1, "Extrusion Quantity (uL)", false, 390, -10, &quantity_keypad_cfg);
   create_start_button(tab1, 0, -10);
+  create_retract_mode_switch(tab1);
 
   create_system_progress_ui(tab2);
   create_tab3_curve_preview_blocks(tab3);
@@ -2037,9 +2858,17 @@ void setup() {
       LV_ALIGN_TOP_RIGHT,     // 對齊方式
       0, 95,                   // x, y offset
       &stepper_motor,     // 圖片
-      45,                    // 圖片縮放
+      256,                    // 圖片縮放
       MotorControlScreen::getScreenHandle(),            // 要跳轉的 screen
       MotorControlScreen::build        // 若尚未建立，先呼叫 builder
+  );
+  btn_tab3_disable_motor = create_disable_motor_button(
+      tab3,
+      85, 85,
+      LV_ALIGN_TOP_RIGHT,
+      0, 190,
+      &stepper_motor_disable,
+      256
   );
  create_nav_button(
       tab3,                   // 放在 tab3
@@ -2073,6 +2902,8 @@ void setup() {
   );
 
   set_tab3_control_buttons_enabled(true);
+  set_retract_switch_enabled(true);
+  retract_move_started = false;
 }
 
 void loop()
@@ -2093,9 +2924,19 @@ void loop()
         {
             const bool was_timeout_stop = stop_requested_by_timeout;
 
+            if (stop_wait_timeout && !stopped) {
+                MotorControlScreen::forceStopState();
+            }
+
             stop_requested = false;
             stop_requested_by_timeout = false;
             is_running = false;
+
+            run_phase = RUN_PHASE_IDLE;
+            phase_start_ms = 0;
+            current_tail_recording = false;
+            current_tail_start_ms = 0;
+            retract_move_started = false;
 
             const char* stop_reason = "Stopped";
 
@@ -2118,6 +2959,8 @@ void loop()
             g_tmc_ramp_cmd = TmcRampCommand();
 
             set_tab3_control_buttons_enabled(true);
+            set_retract_switch_enabled(true);
+            retract_move_started = false;
 
             if (RealtimeCurveRenderer::isInitialized()) {
                 RealtimeCurveRenderer::releaseTempData();
@@ -2147,78 +2990,170 @@ void loop()
     // Normal runtime logic
     // =============================
     if (is_running) {
-        float elapsed_s = (millis() - run_start_ms) / 1000.0f;
+        float phase_elapsed_s =
+            (millis() - phase_start_ms) / 1000.0f;
 
         bool finished_by_motor =
             MotorControlScreen::motionFinished();
+        //
+        if (run_phase == RUN_PHASE_EXTRUDING) {
 
-        bool timeout =
-            recorded_duration_valid &&
-            elapsed_s > (recorded_duration_sec_exact + 5.0f);
+            if (finished_by_motor) {
 
-        // Timeout must enter controlled stop.
-        // Do not cleanup immediately, because the TMC ramp may still be decelerating.
-        if (timeout) {
-            auto tr = MotionModeManager::requestScenario(
-                MotionModeManager::SCENARIO_EXTRUSION_STOPPING
-            );
+                // Freeze extrusion-end TMC target / actual distance.
+                // Do this before retraction starts, otherwise the retraction target
+                // will overwrite the displayed extrusion-end values.
+                freeze_tmc_distance_at_extrusion_end();
 
-            if (!tr.success) {
-                MotionModeManager::forceIdle("Extrusion timeout");
+                if (run_retract_mode_enabled) {
+                    retract_move_started = true;
+
+                    if (!start_retract_move_4mm()) {
+                        MotionModeManager::forceIdle("Retraction failed");
+
+                        is_running = false;
+                        current_tail_recording = false;
+                        retract_move_started = false;
+                        run_phase = RUN_PHASE_IDLE;
+                        phase_start_ms = 0;
+
+                        recorded_duration_valid = false;
+                        realtime_motion_planner_valid = false;
+                        tmc_executable_planner_valid = false;
+                        g_tmc_ramp_cmd = TmcRampCommand();
+
+                        set_tab3_control_buttons_enabled(true);
+                        set_retract_switch_enabled(true);
+
+                        if (start_btn) {
+                            lv_obj_t* label = lv_obj_get_child(start_btn, 0);
+                            lv_label_set_text(label, "START");
+                            lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x0000FF), 0);
+                        }
+
+                        clear_countdown_dialog();
+                        show_missing_param_dialog("Retraction failed");
+
+                        MotorControlScreen::update();
+                        delay(5);
+                        return;
+                    }
+
+                    run_phase = RUN_PHASE_RETRACTING;
+                    phase_start_ms = millis();
+
+                    MotorControlScreen::update();
+                    delay(5);
+                    return;
+                }
+                
+                begin_system_progress_tail_ramp();
+
+                current_tail_recording = true;
+                current_tail_start_ms = millis();
+                run_phase = RUN_PHASE_TAIL_RECORDING;
+                phase_start_ms = millis();
             }
+            else {
+                float extrusion_timeout_margin_s =
+                    calc_extrusion_timeout_margin_s(extrusion_duration_sec_exact);
 
-            MotorControlScreen::stopMotion();
+                float timeout_limit_s =
+                    extrusion_duration_sec_exact + extrusion_timeout_margin_s;
 
-            stop_requested = true;
-            stop_requested_by_timeout = true;
-            stop_request_ms = millis();
+                if (phase_elapsed_s > timeout_limit_s) {
+                    auto tr = MotionModeManager::requestScenario(
+                        MotionModeManager::SCENARIO_EXTRUSION_STOPPING
+                    );
 
-            MotorControlScreen::update();
-            delay(5);
-            return;
+                    if (!tr.success) {
+                        MotionModeManager::forceIdle("Extrusion timeout");
+                    }
+
+                    MotorControlScreen::stopMotion();
+
+                    stop_requested = true;
+                    stop_requested_by_timeout = true;
+                    stop_request_ms = millis();
+
+                    MotorControlScreen::update();
+                    delay(5);
+                    return;
+                }
+            }
         }
+        else if (run_phase == RUN_PHASE_RETRACTING) {
+            
+            if (finished_by_motor) {
+                begin_system_progress_tail_ramp();
 
-        if (finished_by_motor) {
-            if (tmc_executable_planner_valid &&
-                RealtimeCurveRenderer::isInitialized()) {
-
-                float T = recorded_duration_sec_exact;
-                TmcExecutableRampPlanner::Sample sT =
-                    tmc_executable_planner.evaluate(T);
-
-                RealtimeCurveRenderer::pushSample(
-                    T,
-                    sT.volume_uL,
-                    MotorControlScreen::getMeasuredCurrentA()
-                );
+                current_tail_recording = true;
+                current_tail_start_ms = millis();
+                run_phase = RUN_PHASE_TAIL_RECORDING;
+                phase_start_ms = millis();
             }
+            else {
+                float timeout_limit_s =
+                    retraction_duration_sec_exact +
+                    calc_timeout_margin_s(retraction_duration_sec_exact);
 
-            is_running = false;
-            set_tab3_control_buttons_enabled(true);
+                if (phase_elapsed_s > timeout_limit_s) {
+                    auto tr = MotionModeManager::requestScenario(
+                        MotionModeManager::SCENARIO_EXTRUSION_STOPPING
+                    );
 
-            MotionModeManager::finishCurrentScenario();
+                    if (!tr.success) {
+                        MotionModeManager::forceIdle("Retraction timeout");
+                    }
 
-            recorded_duration_valid = false;
-            realtime_motion_planner_valid = false;
-            tmc_executable_planner_valid = false;
-            g_tmc_ramp_cmd = TmcRampCommand();
+                    MotorControlScreen::stopMotion();
 
-            if (RealtimeCurveRenderer::isInitialized()) {
-                RealtimeCurveRenderer::releaseTempData();
+                    stop_requested = true;
+                    stop_requested_by_timeout = true;
+                    stop_request_ms = millis();
+
+                    MotorControlScreen::update();
+                    delay(5);
+                    return;
+                }
             }
+        }
+        else if (run_phase == RUN_PHASE_TAIL_RECORDING) {
 
-            if (start_btn) {
-                lv_obj_t* label = lv_obj_get_child(start_btn, 0);
-                lv_label_set_text(label, "START");
-                lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x0000FF), 0);
+            if (millis() - current_tail_start_ms >=
+                (unsigned long)(CURRENT_TAIL_SEC * 1000.0f)) {
+
+                is_running = false;
+                current_tail_recording = false;
+                retract_move_started = false;
+                run_phase = RUN_PHASE_IDLE;
+                phase_start_ms = 0;
+
+                force_system_progress_operation_complete();
+
+                set_tab3_control_buttons_enabled(true);
+                set_retract_switch_enabled(true);
+
+                MotionModeManager::finishCurrentScenario();
+
+                recorded_duration_valid = false;
+                realtime_motion_planner_valid = false;
+                tmc_executable_planner_valid = false;
+                g_tmc_ramp_cmd = TmcRampCommand();
+
+                if (RealtimeCurveRenderer::isInitialized()) {
+                    RealtimeCurveRenderer::releaseTempData();
+                }
+
+                if (start_btn) {
+                    lv_obj_t* label = lv_obj_get_child(start_btn, 0);
+                    lv_label_set_text(label, "START");
+                    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x0000FF), 0);
+                }
+
+                clear_countdown_dialog();
+                show_finish_dialog();
             }
-
-            lv_arc_set_value(arc_progress, 100);
-            lv_label_set_text(lbl_percent, "100%");
-            lv_obj_align_to(lbl_percent, arc_progress, LV_ALIGN_CENTER, 0, 0);
-
-            clear_countdown_dialog();
-            show_finish_dialog();
         }
     }
 
@@ -2227,81 +3162,102 @@ void loop()
         if (millis() - last_countdown_update >= 50) {
             last_countdown_update = millis();
 
-            unsigned long elapsed_sec =
-                (millis() - run_start_ms) / 1000;
+            unsigned long elapsed_ms = millis() - run_start_ms;
 
-            int remaining =
-                recorded_duration_sec - elapsed_sec;
+            float elapsed_sec_f = elapsed_ms / 1000.0f;
+            float remaining_sec_f =
+                display_duration_sec_exact - elapsed_sec_f;
 
-            if (remaining > 0) {
-                unsigned long elapsed_ms = millis() - run_start_ms;
-
-                float total_sec = recorded_duration_sec_exact;
-                float elapsed_sec_f = elapsed_ms / 1000.0f;
-
-                float remaining_sec_f = total_sec - elapsed_sec_f;
-                if (remaining_sec_f < 0.0f) remaining_sec_f = 0.0f;
-
-                unsigned long remaining_ms = (unsigned long)(remaining_sec_f * 1000.0f + 0.5f);
-                unsigned long sec_int = remaining_ms / 1000;
-                unsigned long sec_frac = (remaining_ms % 1000) / 10;
-
-                lv_label_set_text_fmt(
-                    countdown_label,
-                    "%lu.%02lu s",
-                    sec_int,
-                    sec_frac
-                );
+            if (remaining_sec_f < 0.0f) {
+                remaining_sec_f = 0.0f;
             }
+
+            char remaining_buf[32];
+            format_seconds_2dp(
+                remaining_buf,
+                sizeof(remaining_buf),
+                remaining_sec_f
+            );
+
+            lv_label_set_text_fmt(
+                countdown_label,
+                "%s s",
+                remaining_buf
+            );
         }
     }
 
     // --- System Progress update ---
     if (is_running) {
-        unsigned long elapsed_ms = (millis() - run_start_ms);
-        unsigned long total_ms = (unsigned long)(recorded_duration_sec_exact * 1000.0f);
-
-        if (total_ms < 1) {
-            total_ms = 1;
+        if (system_progress_force_complete) {
+            set_system_progress_percent(100.0f, true);
         }
+        else if (system_progress_tail_ramp_active &&
+                run_phase == RUN_PHASE_TAIL_RECORDING) {
 
-        if (elapsed_ms > total_ms) {
-            elapsed_ms = total_ms;
+            float tail_elapsed_s =
+                (millis() - system_progress_tail_start_ms) / 1000.0f;
+
+            float ratio = tail_elapsed_s / CURRENT_TAIL_SEC;
+
+            if (ratio < 0.0f) {
+                ratio = 0.0f;
+            }
+
+            if (ratio > 1.0f) {
+                ratio = 1.0f;
+            }
+
+            float percent_f =
+                system_progress_tail_start_percent +
+                (99.9f - system_progress_tail_start_percent) * ratio;
+
+            set_system_progress_percent(percent_f, false);
         }
-
-        int percent = (int)((elapsed_ms * 100) / total_ms);
-
-        lv_arc_set_value(arc_progress, percent);
-        lv_label_set_text_fmt(lbl_percent, "%d%%", percent);
+        else {
+            float percent_f = calc_system_progress_percent_f();
+            set_system_progress_percent(percent_f, false);
+        }
     }
 
-    update_system_progress_data();
     MotorControlScreen::update();
+    update_system_progress_data();
 
     // --- realtime curve update ---
-    if (is_running && RealtimeCurveRenderer::isInitialized()) {
+    if ((is_running || current_tail_recording) && RealtimeCurveRenderer::isInitialized()) {
         if (millis() - last_curve_update_ms >= 50) {
             last_curve_update_ms = millis();
 
-            float t_s = (millis() - run_start_ms) / 1000.0f;
+            float chart_t_s = (millis() - run_start_ms) / 1000.0f;
 
             if (recorded_duration_sec_exact <= 0.0f) {
                 recorded_duration_sec_exact = 1.0f;
             }
 
-            if (t_s > recorded_duration_sec_exact) {
-                t_s = recorded_duration_sec_exact;
+            if (chart_total_duration_sec <= 0.0f) {
+                chart_total_duration_sec = recorded_duration_sec_exact;
             }
-            //
+
+            if (chart_t_s > chart_total_duration_sec) {
+                chart_t_s = chart_total_duration_sec;
+            }
+
             if (tmc_executable_planner_valid) {
+                // motion planner 只評估到 motor duration
+                // tail 區間 volume 固定在最後值
+                float eval_t_s = chart_t_s;
+                if (eval_t_s > recorded_duration_sec_exact) {
+                    eval_t_s = recorded_duration_sec_exact;
+                }
+
                 TmcExecutableRampPlanner::Sample sample =
-                    tmc_executable_planner.evaluate(t_s);
+                    tmc_executable_planner.evaluate(eval_t_s);
 
                 float current_A =
                     MotorControlScreen::getMeasuredCurrentA();
 
                 RealtimeCurveRenderer::pushSample(
-                    t_s,
+                    chart_t_s,
                     sample.volume_uL,
                     current_A
                 );
